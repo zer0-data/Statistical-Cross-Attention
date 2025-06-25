@@ -291,11 +291,12 @@ This method ensures that attention scores are correctly normalized across all ho
 
 ## Citation
 ```
-@article{acharya2024starattention,
-  title={Star Attention: Efficient LLM Inference over Long Sequences}, 
+@inproceedings{
+  acharya2025starattention,
+  title={Star Attention: Efficient {LLM} Inference over Long Sequences},
   author={Shantanu Acharya and Fei Jia and Boris Ginsburg},
-  journal={arXiv:2411.17116},
-  year={2024},
+  booktitle={Forty-second International Conference on Machine Learning (ICML)},
+  year={2025},
 }
 ```
 
