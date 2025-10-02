@@ -393,3 +393,174 @@ class DenseAttentionModel:
         output = self._generate_output(input_ids, position_ids)
 
         return {'text': [self._get_output_text(output)]}
+
+# model.py
+
+# ... (keep all existing code from the original file, including imports and all other classes)
+# V V V V REPLACE THE PREVIOUS CustomAccuracyModel WITH THIS FINAL VERSION V V V V
+
+class CustomAccuracyModel:
+    """
+    Implements the custom two-pass mechanism for improved accuracy on a single GPU.
+    - Pass 1: Uses a standard 'eager' attention model to find top-k summary tokens.
+    - Pass 2: Uses a 'flash_attention_2' model to build the final KV cache sequentially.
+    - Phase 2: Uses the 'flash_attention_2' model for fast autoregressive generation.
+    """
+
+    def __init__(self, path: str, max_new_tokens: int, block_size: int, k_summary_size: int, stop_words: Optional[List[str]] = None):
+        if not torch.cuda.is_available():
+            raise RuntimeError("This implementation requires a CUDA-enabled GPU.")
+        
+        self.device = "cuda"
+        self.tokenizer = AutoTokenizer.from_pretrained(path)
+        
+        print("\n[SETUP] Loading model with Flash Attention 2 for generation (Pass 2)...")
+        self.model_flash = LlamaForCausalLM.from_pretrained(
+            path,
+            device_map='auto',
+            torch_dtype=torch.bfloat16,
+            attn_implementation='flash_attention_2',
+        )
+        self.model_flash.eval()
+
+        print("[SETUP] Loading model with Eager Attention for summary finding (Pass 1)...")
+        # For Pass 1, we need the standard 'eager' implementation to get attention scores
+        self.model_eager = LlamaForCausalLM.from_pretrained(
+            path,
+            device_map='auto',
+            torch_dtype=torch.bfloat16,
+            attn_implementation='eager',
+        )
+        self.model_eager.eval()
+
+        # Generation and model parameters
+        self.max_new_tokens = max_new_tokens
+        self.stop_words = stop_words if stop_words else []
+        self.block_size = block_size
+        self.k = k_summary_size
+        print("[SETUP] Initialization complete.")
+
+    def _get_top_k_summary(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Pass 1: Processes a block to find the top-k summary tokens based on attention.
+        This uses the 'eager' model to access attention weights.
+        """
+        with torch.no_grad():
+            outputs = self.model_eager(input_ids, output_attentions=True)
+        
+        all_attentions = torch.stack(outputs.attentions)
+        token_scores = all_attentions.sum(dim=(0, 1, 2, -1))
+        
+        _, top_k_indices = torch.topk(token_scores, min(self.k, token_scores.shape[0]))
+        
+        top_k_indices_sorted, _ = torch.sort(top_k_indices)
+        summary_ids = input_ids[:, top_k_indices_sorted]
+        
+        return summary_ids
+
+    def _get_output_text(self, output_ids: torch.Tensor) -> str:
+        """Decodes the generated token IDs and cleans up the text."""
+        generated_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        
+        assistant_marker = "assistant\n\n"
+        if assistant_marker in generated_text:
+            generated_text = generated_text.split(assistant_marker)[-1]
+
+        for s in self.stop_words:
+            generated_text = generated_text.split(s)[0]
+
+        return generated_text.strip()
+
+    def __call__(self, prompt_context: str, prompt_query: str) -> Dict[str, List[str]]:
+        context_ids = self.tokenizer.encode(prompt_context, return_tensors='pt').to(self.device)
+        context_blocks = list(context_ids.split(self.block_size, dim=1))
+        # --- DEBUG PRINT ---
+        print(f"\n[DEBUG] Total context tokens: {context_ids.shape[1]}")
+        print(f"[DEBUG] Context split into {len(context_blocks)} blocks of max size {self.block_size}.")
+
+        with torch.no_grad():
+            # === PHASE 1, PASS 1: GENERATE SUMMARIES ===
+            print("\n--- Phase 1, Pass 1: Generating summaries... ---")
+            summaries = []
+            for i, block in enumerate(context_blocks):
+                print(f"  [Pass 1] Processing block {i+1}/{len(context_blocks)} (shape: {block.shape}) to find summary...")
+                summary_ids = self._get_top_k_summary(block)
+                summaries.append(summary_ids)
+                # --- DEBUG PRINT ---
+                print(f"    -> Generated summary shape: {summary_ids.shape}")
+                
+                # CRUCIAL FIX: Clear the cache to release memory from the eager forward pass
+                torch.cuda.empty_cache()
+            print("--- [Pass 1] All summaries generated. ---")
+
+            # === PHASE 1, PASS 2: BUILD FINAL KV CACHE ===
+            print("\n--- Phase 1, Pass 2: Building final KV cache incrementally... ---")
+            full_kv_cache = None
+            for i, block in enumerate(context_blocks):
+                print(f"  [Pass 2] Processing block {i+1}/{len(context_blocks)} (shape: {block.shape}) to build its KV cache...")
+                
+                previous_summaries = summaries[:i]
+                if previous_summaries:
+                    augmented_input_ids = torch.cat(previous_summaries + [block], dim=1)
+                    summary_len = sum(s.shape[1] for s in previous_summaries)
+                else:
+                    augmented_input_ids = block
+                    summary_len = 0
+                
+                # --- DEBUG PRINT ---
+                print(f"    -> Augmented input shape: {augmented_input_ids.shape} (Summary len: {summary_len})")
+                
+                outputs = self.model_flash(augmented_input_ids, use_cache=True)
+                current_kv_cache = outputs.past_key_values
+                # --- DEBUG PRINT ---
+                print(f"    -> Intermediate KV cache key shape (layer 0): {current_kv_cache[0][0].shape}")
+                
+                # Slice the cache to keep only the part for the current block
+                sliced_kv_cache = []
+                for layer_cache in current_kv_cache:
+                    key, value = layer_cache
+                    sliced_key = key[:, :, summary_len:, :]
+                    sliced_value = value[:, :, summary_len:, :]
+                    sliced_kv_cache.append((sliced_key, sliced_value))
+                # --- DEBUG PRINT ---
+                print(f"    -> Sliced KV cache key shape (layer 0): {sliced_kv_cache[0][0].shape}")
+                
+                # Incrementally build the final KV cache
+                if full_kv_cache is None:
+                    full_kv_cache = tuple(sliced_kv_cache)
+                else:
+                    new_full_cache = []
+                    for idx, layer_cache in enumerate(full_kv_cache):
+                        full_key, full_value = layer_cache
+                        slice_key, slice_value = sliced_kv_cache[idx]
+                        combined_key = torch.cat([full_key, slice_key], dim=2)
+                        combined_value = torch.cat([full_value, slice_value], dim=2)
+                        new_full_cache.append((combined_key, combined_value))
+                    full_kv_cache = tuple(new_full_cache)
+                # --- DEBUG PRINT ---
+                print(f"    -> Total KV cache key shape (layer 0) updated to: {full_kv_cache[0][0].shape}")
+
+            print("--- [Pass 2] Final KV cache for the full context is built. ---")
+
+            # === PHASE 2: GENERATE RESPONSE ===
+            print("\n--- Phase 2: Generating response... ---")
+            generation_prompt = (
+                f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+                f"You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+                f"{prompt_query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            )
+            generation_ids = self.tokenizer.encode(generation_prompt, return_tensors='pt').to(self.device)
+            
+            # --- DEBUG PRINT ---
+            print(f"  [Phase 2] Input query shape: {generation_ids.shape}")
+            print(f"  [Phase 2] Using past_key_values with key shape (layer 0): {full_kv_cache[0][0].shape}")
+
+            outputs = self.model_flash.generate(
+                generation_ids,
+                max_new_tokens=self.max_new_tokens,
+                past_key_values=full_kv_cache,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+            
+            generated_text = self._get_output_text(outputs)
+            return {'text': [generated_text]}
