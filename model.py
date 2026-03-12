@@ -13,12 +13,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
+
+
+def compute_block_summaries(
+    all_block_tokens: List[torch.Tensor],
+    all_block_positions: List[torch.Tensor],
+    k: int = 32,
+    method: str = "tfidf",
+) -> List[Dict[str, torch.Tensor]]:
+    """Compute lightweight statistical summaries for each block.
+
+    For each block, selects the top-k most informative tokens using
+    TF-IDF scoring (or random fallback). Each summary retains original
+    position IDs for RoPE compatibility.
+
+    Args:
+        all_block_tokens: list of 1D tensors, one per block (token IDs).
+        all_block_positions: list of 1D tensors, one per block (position IDs).
+        k: number of summary tokens per block.
+        method: "tfidf" or "random".
+
+    Returns:
+        List of dicts with keys 'token_ids' and 'pos_ids', each a 1D tensor.
+    """
+    num_blocks = len(all_block_tokens)
+
+    if method == "random":
+        summaries = []
+        for blk_tok, blk_pos in zip(all_block_tokens, all_block_positions):
+            actual_k = min(k, blk_tok.shape[0])
+            idx = torch.randperm(blk_tok.shape[0])[:actual_k].sort().values
+            summaries.append({
+                'token_ids': blk_tok[idx],
+                'pos_ids': blk_pos[idx],
+            })
+        return summaries
+
+    # ---------- TF-IDF scoring ----------
+    # Document frequency: how many blocks contain each token
+    df: Counter = Counter()
+    for blk_tok in all_block_tokens:
+        unique_tokens = blk_tok.unique().tolist()
+        df.update(unique_tokens)
+
+    summaries = []
+    for blk_tok, blk_pos in zip(all_block_tokens, all_block_positions):
+        tokens_list = blk_tok.tolist()
+        block_len = len(tokens_list)
+        # Term frequency within this block
+        tf: Counter = Counter(tokens_list)
+
+        scores = torch.zeros(block_len, dtype=torch.float32)
+        for i, t in enumerate(tokens_list):
+            tf_val = tf[t] / block_len
+            idf_val = math.log(num_blocks / max(df[t], 1))
+            scores[i] = tf_val * idf_val
+
+        actual_k = min(k, block_len)
+        _, top_indices = torch.topk(scores, actual_k)
+        top_indices = top_indices.sort().values  # maintain positional order
+
+        summaries.append({
+            'token_ids': blk_tok[top_indices],
+            'pos_ids': blk_pos[top_indices],
+        })
+
+    return summaries
 
 
 class DistributedInferenceBaseModel:
@@ -172,7 +240,28 @@ class DistributedInferenceBaseModel:
 
 
 class StarAttentionModel(DistributedInferenceBaseModel):
-    """Star Attention - Phase 1 and Phase 2"""
+    """Star Attention - Phase 1 and Phase 2
+
+    Extended with Statistical Block Summaries for cross-block semantic
+    awareness during parallel KV cache construction.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        max_new_tokens: int,
+        stop_words: Optional[List[str]] = None,
+        block_size: int = -1,
+        anchor_block_size: int = -1,
+        summary_k: int = 32,
+        summary_method: str = "tfidf",
+        discard_summary_kv: bool = True,
+    ):
+        super().__init__(path, max_new_tokens, stop_words=stop_words,
+                         block_size=block_size, anchor_block_size=anchor_block_size)
+        self.summary_k = summary_k
+        self.summary_method = summary_method
+        self.discard_summary_kv = discard_summary_kv
 
     def _tokenize_and_partition_context(self, ctx):
         # Tokenize the context
@@ -192,26 +281,89 @@ class StarAttentionModel(DistributedInferenceBaseModel):
 
         return ctx_ids, position_ids, ctx_len
 
-    def _process_blockwise_context(self, ctx_ids_blocks, position_ids_blocks):
-        """Phase 1 of Star Attention: Blockwise Context Encoding with Anchor Blocks"""
+    def _process_blockwise_context(self, ctx_ids_blocks, position_ids_blocks, block_summaries=None):
+        """Phase 1 of Star Attention: Blockwise Context Encoding with
+        Statistical Block Summaries.
 
-        # If the anchor block size is not provided, use the entire first block
-        if self.anchor_block_size is None:
-            self.anchor_block_size = ctx_ids_blocks[0][0].shape[-1]
+        Each block's input context is assembled as:
+            [S_1, ..., S_(i-1), B_i, S_(i+1), ..., S_m]
+        Summaries from earlier blocks precede B_i; summaries from later
+        blocks follow it.  The entire sequence is then sorted by
+        position_id for flash-attention monotonicity, and after the
+        forward pass only B_i's KV states are retained.
+        """
+
+        # Flatten all block indices so we can figure out which *global* block
+        # index the current rank/idx pair corresponds to.
+        total_blocks = sum(len(ctx_ids_blocks[r]) for r in range(len(ctx_ids_blocks)))
+        blocks_before_rank = sum(len(ctx_ids_blocks[r]) for r in range(self.rank))
 
         kv_rank = []
         for idx in range(len(ctx_ids_blocks[self.rank])):
             # Select the current block
-            ctx_block = ctx_ids_blocks[self.rank][idx]
-            position_block = position_ids_blocks[self.rank][idx]
+            ctx_block = ctx_ids_blocks[self.rank][idx]          # (1, block_size)
+            position_block = position_ids_blocks[self.rank][idx]  # (1, block_size)
+            block_size_cur = ctx_block.shape[-1]
 
-            # From 2nd block onwards, prepend the anchor block to the current block
-            if self.rank != 0 or idx > 0:
-                ctx_block = torch.cat((ctx_ids_blocks[0][0][:, : self.anchor_block_size], ctx_block), dim=-1)
-                position_block = torch.cat(
-                    (position_ids_blocks[0][0][:, : self.anchor_block_size], position_block), dim=-1
-                )
+            summary_len = 0
+            if block_summaries is not None:
+                global_block_idx = blocks_before_rank + idx
 
+                # Collect pre-block summaries (j < i) and post-block summaries (j > i)
+                pre_token_parts, pre_pos_parts = [], []
+                post_token_parts, post_pos_parts = [], []
+                for j in range(total_blocks):
+                    if j == global_block_idx:
+                        continue  # skip self
+                    s = block_summaries[j]
+                    if j < global_block_idx:
+                        pre_token_parts.append(s['token_ids'])
+                        pre_pos_parts.append(s['pos_ids'])
+                    else:
+                        post_token_parts.append(s['token_ids'])
+                        post_pos_parts.append(s['pos_ids'])
+
+                # Assemble: [S_pre | B_i | S_post]
+                all_tok = []
+                all_pos = []
+                pre_len = 0
+                if pre_token_parts:
+                    pre_tok = torch.cat(pre_token_parts).unsqueeze(0).to(ctx_block.device)
+                    pre_pos = torch.cat(pre_pos_parts).unsqueeze(0).to(position_block.device)
+                    pre_len = pre_tok.shape[-1]
+                    all_tok.append(pre_tok)
+                    all_pos.append(pre_pos)
+
+                all_tok.append(ctx_block)
+                all_pos.append(position_block)
+
+                if post_token_parts:
+                    post_tok = torch.cat(post_token_parts).unsqueeze(0).to(ctx_block.device)
+                    post_pos = torch.cat(post_pos_parts).unsqueeze(0).to(position_block.device)
+                    all_tok.append(post_tok)
+                    all_pos.append(post_pos)
+
+                ctx_block = torch.cat(all_tok, dim=-1)
+                position_block = torch.cat(all_pos, dim=-1)
+                summary_len = ctx_block.shape[-1] - block_size_cur
+
+            # ---------- Sort by position_id for flash-attn compatibility ----------
+            # Flash attention checks for monotonically non-decreasing position_ids;
+            # non-monotonic ids trigger varlen multi-sequence segmentation which
+            # would incorrectly split our single-sequence context.
+            if summary_len > 0:
+                # Mark B_i tokens before sorting (B_i sits at [pre_len .. pre_len+block_size_cur))
+                is_bi = torch.zeros(ctx_block.shape[-1], dtype=torch.bool, device=ctx_block.device)
+                is_bi[pre_len:pre_len + block_size_cur] = True
+
+                sort_idx = position_block.squeeze(0).argsort(stable=True)
+                ctx_block = ctx_block[:, sort_idx]
+                position_block = position_block[:, sort_idx]
+                is_bi_sorted = is_bi[sort_idx]
+            else:
+                is_bi_sorted = None
+
+            # ---------- Forward ----------
             with torch.no_grad():
                 kv_block = self.model(
                     ctx_block,
@@ -221,10 +373,10 @@ class StarAttentionModel(DistributedInferenceBaseModel):
                     enable_star_attn=False,
                 ).past_key_values  # type: ignore
 
-            # Discard the anchor block KV cache
-            if self.rank != 0 or idx > 0:
+            # ---------- Extract only B_i's KV entries ----------
+            if is_bi_sorted is not None and self.discard_summary_kv:
                 kv_block = [
-                    [x[0][:, :, self.anchor_block_size :], x[1][:, :, self.anchor_block_size :]] for x in kv_block
+                    [x[0][:, :, is_bi_sorted], x[1][:, :, is_bi_sorted]] for x in kv_block
                 ]
 
             kv_rank = (
@@ -247,8 +399,25 @@ class StarAttentionModel(DistributedInferenceBaseModel):
             torch.stack(position_ids.split(self.block_size, dim=-1)), self.world_size
         )
 
-        # Phase 1: Generate the KV cache for the local context
-        kv_rank = self._process_blockwise_context(ctx_ids_blocks, position_ids_blocks)
+        # ---------- Compute statistical block summaries ----------
+        # Flatten all blocks into a simple list for summary computation
+        flat_block_tokens = []   # list of 1-D CPU tensors
+        flat_block_positions = []
+        for rank_blocks_t, rank_blocks_p in zip(ctx_ids_blocks, position_ids_blocks):
+            for blk_t, blk_p in zip(rank_blocks_t, rank_blocks_p):
+                flat_block_tokens.append(blk_t.squeeze(0).cpu())
+                flat_block_positions.append(blk_p.squeeze(0).cpu())
+
+        block_summaries = compute_block_summaries(
+            flat_block_tokens,
+            flat_block_positions,
+            k=self.summary_k,
+            method=self.summary_method,
+        )
+
+        # Phase 1: Generate the KV cache for the local context (with summaries)
+        kv_rank = self._process_blockwise_context(ctx_ids_blocks, position_ids_blocks,
+                                                   block_summaries=block_summaries)
         if self.rank == self.world_size - 1:  # discard padding from the last rank
             padding = ctx_ids.shape[-1] - ctx_len
             if padding > 0:
@@ -256,7 +425,7 @@ class StarAttentionModel(DistributedInferenceBaseModel):
                     [kv_rank[i][0][:, :, :-padding], kv_rank[i][1][:, :, :-padding]] for i in range(len(kv_rank))
                 ]
 
-        # Phase 2: Process query with global attention
+        # Phase 2: Process query with global attention (unchanged)
         qry_ids = self._tokenize(prompt_query)
         qry_position_ids = torch.arange(ctx_len, ctx_len + qry_ids.shape[-1]).unsqueeze(0).to(self.model.device)
         output = self._generate_output(qry_ids, qry_position_ids, kv_rank)

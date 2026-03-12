@@ -68,6 +68,9 @@ def load_model(
     block_size=-1,
     anchor_block_size=-1,
     stop_words=None,
+    summary_k=32,
+    summary_method="tfidf",
+    discard_summary_kv=True,
 ):
     if attn_type == 'dense':
         from model import DenseAttentionModel
@@ -97,6 +100,9 @@ def load_model(
             max_new_tokens=tokens_to_generate,
             stop_words=stop_words,
             anchor_block_size=anchor_block_size,
+            summary_k=summary_k,
+            summary_method=summary_method,
+            discard_summary_kv=discard_summary_kv,
         )
 
     else:
@@ -116,6 +122,9 @@ def main(
     block_size: int = -1,
     anchor_block_size: int = -1,
     use_cache: bool = False,
+    summary_k: int = 32,
+    summary_method: str = "tfidf",
+    discard_summary_kv: bool = True,
 ):
     """Run inference using Star-Attention.
 
@@ -155,6 +164,9 @@ def main(
         block_size,
         anchor_block_size,
         stop_words=stop_words,
+        summary_k=summary_k,
+        summary_method=summary_method,
+        discard_summary_kv=discard_summary_kv,
     )
 
     if rank == 0:
@@ -210,6 +222,11 @@ if __name__ == '__main__':
     parser.add_argument(
         '--use_cache', action='store_true', help='resume from last generation if the output file already exists'
     )
+    parser.add_argument('--summary_k', type=int, default=32, help='number of summary tokens per block')
+    parser.add_argument('--summary_method', type=str, default='tfidf', choices=['tfidf', 'random'],
+                        help='method for selecting summary tokens')
+    parser.add_argument('--no_discard_summary_kv', action='store_true',
+                        help='if set, keep summary KV states in the final cache (default: discard)')
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -230,4 +247,7 @@ if __name__ == '__main__':
         block_size=args.block_size,
         anchor_block_size=args.anchor_block_size,
         use_cache=args.use_cache,
+        summary_k=args.summary_k,
+        summary_method=args.summary_method,
+        discard_summary_kv=not args.no_discard_summary_kv,
     )

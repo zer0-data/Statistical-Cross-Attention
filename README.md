@@ -1,8 +1,11 @@
 # Star Attention: Efficient LLM Inference over Long Sequences
+## Extended with Statistical Cross-Attention Block Summaries
 
-This repository contains code for the paper [Star Attention: Efficient LLM Inference over Long Sequences](https://arxiv.org/abs/2411.17116). Star Attention is a novel block-sparse attention mechanism designed to enable efficient inference on long sequences in transformer-based LLMs. The method operates in two phases:
-1. **Phase 1 - Context Encoding**: The context tokens are processed using blockwise-local attention, with the context segmented into blocks where each block is prefixed with an anchor block.
-2. **Phase 2 - Query Processing and Token Generation**: The query and response tokens attend to all prior cached tokens through sequence-global attention.
+This repository contains code based on the paper [Star Attention: Efficient LLM Inference over Long Sequences](https://arxiv.org/abs/2411.17116), extended with **Statistical Cross-Attention** — a method that replaces the fixed anchor block with lightweight TF-IDF block summaries to improve cross-block semantic awareness during parallel KV cache construction.
+
+The method operates in two phases:
+1. **Phase 1 - Context Encoding**: The context tokens are processed using blockwise-local attention. Each block is augmented with statistical summaries (top-k TF-IDF tokens) from all other blocks, providing global semantic hints while preserving parallelism.
+2. **Phase 2 - Query Processing and Token Generation**: The query and response tokens attend to all prior cached tokens through sequence-global attention (unchanged).
 
 Star Attention **improves the inference time by up to 11x** while **preserving 97-100% of accuracy**. The method is **compatible with most Transformer-based LLMs trained with global attention, operating seamlessly out-of-the-box without additional training/finetuning.** Furthermore, Star Attention is **orthogonal to other optimization methods**, including Flash Attention and KV cache compression techniques, allowing for potential combined enhancements.
 
@@ -97,16 +100,17 @@ This codebase contains the implementation of Star Attention in PyTorch using the
    - [Dependencies](#dependencies)
    - [RULER Setup](#ruler-setup)
    - [Downloading Models](#downloading-models)
-2. [Launching Inference with Star Attention](#launching-inference-with-star-attention)
+2. [Statistical Cross-Attention](#statistical-cross-attention)
+3. [Launching Inference with Star Attention](#launching-inference-with-star-attention)
    - [RULER](#ruler)
    - [BABILong](#babilong)
    - [Running Inference on Custom Data](#running-inference-on-custom-data)
-3. [Two Phases of Star Attention](#two-phases-of-star-attention)
+4. [Two Phases of Star Attention](#two-phases-of-star-attention)
    - [Phase 1 - Context Encoding](#phase-1---context-encoding)
    - [Phase 2 - Query Processing and Token Generation](#phase-2---query-processing-and-token-generation)
-4. [Citation](#citation)
-5. [References](#references)
-6. [Contact/Getting Help](#contactgetting-help)
+5. [Citation](#citation)
+6. [References](#references)
+7. [Contact/Getting Help](#contactgetting-help)
 
 
 ## Setup Instructions
@@ -140,6 +144,31 @@ $ bash ruler/download_data.sh
 To download a model from HuggingFace, use the script: [`scripts/download_hf_model.py`](scripts/download_hf_model.py).
 
 *NOTE: For certain models, you might need to input the huggingface hub token from your account settings via the `--token` flag.*
+
+## Statistical Cross-Attention
+
+Statistical Cross-Attention replaces the fixed anchor block with lightweight, non-neural summaries computed via TF-IDF scoring. During Phase 1, each block's context is augmented with the top-k most informative tokens from every other block:
+
+```
+GPU0: [B0 | S1, S2, S3]          # block 0 + summaries of blocks 1-3
+GPU1: [S0 | B1 | S2, S3]         # summary of block 0 + block 1 + summaries of blocks 2-3
+GPU2: [S0, S1 | B2 | S3]         # summaries of blocks 0-1 + block 2 + summary of block 3
+GPU3: [S0, S1, S2 | B3]          # summaries of blocks 0-2 + block 3
+```
+
+Each summary token retains its **original position ID** for RoPE compatibility. After the forward pass, only `B_i`'s KV states are kept — summaries are discarded.
+
+### Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--summary_k` | `32` | Number of summary tokens per block |
+| `--summary_method` | `tfidf` | Token selection method (`tfidf` or `random`) |
+| `--no_discard_summary_kv` | off | If set, keeps summary KV states in the final cache |
+
+### Overhead
+
+With `b=4096`, `k=32`, `m=16` blocks: each GPU processes `b + (m-1)*k = 4576` tokens — roughly **12% compute overhead** vs baseline. Summary computation is `O(block_size)` per block, negligible vs transformer compute.
 
 ## Launching Inference with Star Attention
 
@@ -203,19 +232,21 @@ $ python babilong/gather_results_babilong.py \
 To run inference on your custom data, use the script: [`run_star_attn_inference.py`](run_star_attn_inference.py). The scripts takes in the input data in `.jsonl` format in which each line of jsonl should look like:
 ```json
 {
-  "index": "<sample index>",  # optional
+  "index": "<sample index>",
   "input_context": "<long context portion of the input sample>",
   "input_query": "<query portion of the input sample>",
-  "output": "<expected output response>",
+  "output": "<expected output response>"
 }
 ```
 
 Script usage:
 ```
-$ python run_star_attn_inference.py \
+$ torchrun --nproc_per_node=4 run_star_attn_inference.py \
     --model_path <path_to_model> \
     --attn_type star \
-    --block_size <context_block_size> \
+    --block_size 4096 \
+    --summary_k 32 \
+    --summary_method tfidf \
     --tokens_to_generate <num_tokens_to_generate> \
     --stop_words <end_of_sequence_tokens> \
     --input_path <path_to_input_jsonl> \
@@ -231,26 +262,19 @@ $ python run_star_attn_inference.py --help
 
 Given a system with $H$ hosts and an input sample with context $c$ followed by query $q$, Star Attention operates in two phases:
 
-### Phase 1 - Context Encoding
-
-<div align="center">
-  <img
-    src="images/star_attn_phase1.png"
-    alt="star attention phase 1"
-  />
-</div>
-<br />
+### Phase 1 - Context Encoding (with Statistical Summaries)
 
 - The context is segmented into contiguous blocks:
   <div align="center">
     $$c = [c_1, c_2, \ldots, c_n]$$
   </div>
-- From the second block, each block $c_i$ is prefixed with $c_1$ - called the anchor block. Thus forming an augmented context:
+- For each block $c_i$, a statistical summary $S_i$ is computed using TF-IDF scoring, selecting the top-$k$ most informative tokens while preserving their original position IDs.
+- Each block is augmented with summaries from all other blocks:
   <div align="center">
-    $$c' = [c_1, (c_1 \: c_2), (c_1 \: c_3), \ldots, (c_1 \: c_n)]$$
+    $$c'_i = [S_1, \ldots, S_{i-1}, c_i, S_{i+1}, \ldots, S_n]$$
   </div>
 - The augmented context blocks are distributed across the $H$ hosts, with each host attending only to its assigned blocks.
-  - After processing the context blocks, each host stores the *non-anchor* portion of the KV cache.
+  - After processing, each host stores **only** $c_i$'s KV cache — all summary KV states are discarded.
 
 ### Phase 2 - Query Processing and Token Generation
 
