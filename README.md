@@ -4,7 +4,7 @@
 This repository contains code based on the paper [Star Attention: Efficient LLM Inference over Long Sequences](https://arxiv.org/abs/2411.17116), extended with **Statistical Cross-Attention** — a method that replaces the fixed anchor block with lightweight TF-IDF block summaries to improve cross-block semantic awareness during parallel KV cache construction.
 
 The method operates in two phases:
-1. **Phase 1 - Context Encoding**: The context tokens are processed using blockwise-local attention. Each block is augmented with statistical summaries (top-k TF-IDF tokens) from all other blocks, providing global semantic hints while preserving parallelism.
+1. **Phase 1 - Context Encoding**: The context tokens are processed using blockwise-local attention. Each block is augmented with statistical summaries (top-k TF-IDF tokens) from earlier blocks, providing global semantic hints while preserving parallelism.
 2. **Phase 2 - Query Processing and Token Generation**: The query and response tokens attend to all prior cached tokens through sequence-global attention (unchanged).
 
 Star Attention **improves the inference time by up to 11x** while **preserving 97-100% of accuracy**. The method is **compatible with most Transformer-based LLMs trained with global attention, operating seamlessly out-of-the-box without additional training/finetuning.** Furthermore, Star Attention is **orthogonal to other optimization methods**, including Flash Attention and KV cache compression techniques, allowing for potential combined enhancements.
@@ -147,12 +147,12 @@ To download a model from HuggingFace, use the script: [`scripts/download_hf_mode
 
 ## Statistical Cross-Attention
 
-Statistical Cross-Attention replaces the fixed anchor block with lightweight, non-neural summaries computed via TF-IDF scoring. During Phase 1, each block's context is augmented with the top-k most informative tokens from every other block:
+Statistical Cross-Attention replaces the fixed anchor block with lightweight, non-neural summaries computed via TF-IDF scoring. During Phase 1, each block's context is augmented with the top-k most informative tokens from earlier blocks (future summaries are omitted due to causal masking):
 
 ```
-GPU0: [B0 | S1, S2, S3]          # block 0 + summaries of blocks 1-3
-GPU1: [S0 | B1 | S2, S3]         # summary of block 0 + block 1 + summaries of blocks 2-3
-GPU2: [S0, S1 | B2 | S3]         # summaries of blocks 0-1 + block 2 + summary of block 3
+GPU0: [B0]                       # block 0
+GPU1: [S0 | B1]                  # summary of block 0 + block 1
+GPU2: [S0, S1 | B2]              # summaries of blocks 0-1 + block 2
 GPU3: [S0, S1, S2 | B3]          # summaries of blocks 0-2 + block 3
 ```
 
@@ -168,7 +168,7 @@ Each summary token retains its **original position ID** for RoPE compatibility. 
 
 ### Overhead
 
-With `b=4096`, `k=32`, `m=16` blocks: each GPU processes `b + (m-1)*k = 4576` tokens — roughly **12% compute overhead** vs baseline. Summary computation is `O(block_size)` per block, negligible vs transformer compute.
+With `b=4096`, `k=32`, `m=16` blocks: each GPU processes at most `b + (m-1)*k = 4576` tokens (for the last block) — bounded at **~12% max compute overhead** vs baseline. Summary computation is `O(block_size)` per block, negligible vs transformer compute.
 
 ## Launching Inference with Star Attention
 
@@ -269,9 +269,9 @@ Given a system with $H$ hosts and an input sample with context $c$ followed by q
     $$c = [c_1, c_2, \ldots, c_n]$$
   </div>
 - For each block $c_i$, a statistical summary $S_i$ is computed using TF-IDF scoring, selecting the top-$k$ most informative tokens while preserving their original position IDs.
-- Each block is augmented with summaries from all other blocks:
+- Each block is augmented with summaries from earlier blocks (future summaries are omitted because the causal mask prevents $c_i$ from attending to tokens at higher sequence indices):
   <div align="center">
-    $$c'_i = [S_1, \ldots, S_{i-1}, c_i, S_{i+1}, \ldots, S_n]$$
+    $$c'_i = [S_1, \ldots, S_{i-1}, c_i]$$
   </div>
 - The augmented context blocks are distributed across the $H$ hosts, with each host attending only to its assigned blocks.
   - After processing, each host stores **only** $c_i$'s KV cache — all summary KV states are discarded.
