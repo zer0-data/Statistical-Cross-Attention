@@ -77,6 +77,20 @@ def compute_block_summaries(
             idf_val = math.log(num_blocks / max(df[t], 1))
             scores[i] = tf_val * idf_val
 
+        # --- Diminishing-returns penalty for repeated tokens ----------
+        # The n-th occurrence of the same token has its score divided by
+        # log2(1 + n), so: 1st → full, 2nd → /log2(3)≈0.63×,
+        # 3rd → /log2(4)=0.50×, etc.  This prevents blind duplication
+        # from dominating topk while still allowing positionally-
+        # important repeats (e.g. entity mentions in multihop chains)
+        # to survive when their base TF-IDF score is high enough.
+        occurrence_count: Counter = Counter()
+        for i, t in enumerate(tokens_list):
+            occurrence_count[t] += 1
+            n = occurrence_count[t]
+            if n > 1:
+                scores[i] = scores[i] / math.log2(1 + n)
+
         actual_k = min(k, block_len)
         _, top_indices = torch.topk(scores, actual_k)
         top_indices = top_indices.sort().values  # maintain positional order
@@ -286,16 +300,16 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         Statistical Block Summaries.
 
         Each block's input context is assembled as:
-            [S_1, ..., S_(i-1), B_i, S_(i+1), ..., S_m]
-        Summaries from earlier blocks precede B_i; summaries from later
-        blocks follow it.  The entire sequence is then sorted by
+            [S_1, ..., S_(i-1), B_i]
+        Only summaries from earlier blocks are prepended (S_post is
+        omitted because the causal mask prevents B_i from attending to
+        tokens at higher sequence indices).  The sequence is sorted by
         position_id for flash-attention monotonicity, and after the
         forward pass only B_i's KV states are retained.
         """
 
         # Flatten all block indices so we can figure out which *global* block
         # index the current rank/idx pair corresponds to.
-        total_blocks = sum(len(ctx_ids_blocks[r]) for r in range(len(ctx_ids_blocks)))
         blocks_before_rank = sum(len(ctx_ids_blocks[r]) for r in range(self.rank))
 
         kv_rank = []
@@ -309,21 +323,14 @@ class StarAttentionModel(DistributedInferenceBaseModel):
             if block_summaries is not None:
                 global_block_idx = blocks_before_rank + idx
 
-                # Collect pre-block summaries (j < i) and post-block summaries (j > i)
+                # Collect only pre-block summaries (j < i)
                 pre_token_parts, pre_pos_parts = [], []
-                post_token_parts, post_pos_parts = [], []
-                for j in range(total_blocks):
-                    if j == global_block_idx:
-                        continue  # skip self
+                for j in range(global_block_idx):
                     s = block_summaries[j]
-                    if j < global_block_idx:
-                        pre_token_parts.append(s['token_ids'])
-                        pre_pos_parts.append(s['pos_ids'])
-                    else:
-                        post_token_parts.append(s['token_ids'])
-                        post_pos_parts.append(s['pos_ids'])
+                    pre_token_parts.append(s['token_ids'])
+                    pre_pos_parts.append(s['pos_ids'])
 
-                # Assemble: [S_pre | B_i | S_post]
+                # Assemble: [S_pre | B_i]
                 all_tok = []
                 all_pos = []
                 pre_len = 0
@@ -336,12 +343,6 @@ class StarAttentionModel(DistributedInferenceBaseModel):
 
                 all_tok.append(ctx_block)
                 all_pos.append(position_block)
-
-                if post_token_parts:
-                    post_tok = torch.cat(post_token_parts).unsqueeze(0).to(ctx_block.device)
-                    post_pos = torch.cat(post_pos_parts).unsqueeze(0).to(position_block.device)
-                    all_tok.append(post_tok)
-                    all_pos.append(post_pos)
 
                 ctx_block = torch.cat(all_tok, dim=-1)
                 position_block = torch.cat(all_pos, dim=-1)
@@ -400,13 +401,21 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         )
 
         # ---------- Compute statistical block summaries ----------
-        # Flatten all blocks into a simple list for summary computation
+        # Flatten all blocks into a simple list for summary computation.
+        # Trim padding from the last block so that pad tokens (ID 0) are
+        # never fed into TF-IDF scoring.
+        padding = ctx_ids.shape[-1] - ctx_len  # number of trailing pad tokens
         flat_block_tokens = []   # list of 1-D CPU tensors
         flat_block_positions = []
         for rank_blocks_t, rank_blocks_p in zip(ctx_ids_blocks, position_ids_blocks):
             for blk_t, blk_p in zip(rank_blocks_t, rank_blocks_p):
                 flat_block_tokens.append(blk_t.squeeze(0).cpu())
                 flat_block_positions.append(blk_p.squeeze(0).cpu())
+
+        # Strip padding from the last block (padding sits at the tail)
+        if padding > 0 and flat_block_tokens:
+            flat_block_tokens[-1] = flat_block_tokens[-1][:-padding]
+            flat_block_positions[-1] = flat_block_positions[-1][:-padding]
 
         block_summaries = compute_block_summaries(
             flat_block_tokens,
