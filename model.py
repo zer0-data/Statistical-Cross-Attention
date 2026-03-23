@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
+from transformers.cache_utils import DynamicCache
 
 
 def compute_block_summaries(
@@ -388,6 +389,17 @@ class StarAttentionModel(DistributedInferenceBaseModel):
                 ]
             )
 
+        # ---------- Wrap in DynamicCache ----------
+        # kv_rank is a List[List[Tensor]] (or DynamicCache for single-block
+        # no-discard path).  Always return a proper DynamicCache so that
+        # LlamaModel.forward never falls back to the deprecated
+        # DynamicCache.from_legacy_cache() conversion.
+        if not isinstance(kv_rank, DynamicCache):
+            cache = DynamicCache()
+            for layer_idx in range(len(kv_rank)):
+                cache.update(kv_rank[layer_idx][0], kv_rank[layer_idx][1], layer_idx)
+            kv_rank = cache
+
         return kv_rank
 
     def __call__(self, prompt_context: str, prompt_query: str) -> Dict[str, List[str]]:
@@ -430,9 +442,9 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         if self.rank == self.world_size - 1:  # discard padding from the last rank
             padding = ctx_ids.shape[-1] - ctx_len
             if padding > 0:
-                kv_rank = [
-                    [kv_rank[i][0][:, :, :-padding], kv_rank[i][1][:, :, :-padding]] for i in range(len(kv_rank))
-                ]
+                for i in range(len(kv_rank)):
+                    kv_rank.key_cache[i] = kv_rank.key_cache[i][:, :, :-padding]
+                    kv_rank.value_cache[i] = kv_rank.value_cache[i][:, :, :-padding]
 
         # Phase 2: Process query with global attention (unchanged)
         qry_ids = self._tokenize(prompt_query)
@@ -498,9 +510,9 @@ class RingAttentionModel(DistributedInferenceBaseModel):
         if self.rank == self.world_size - 1:  # discard padding from the last rank
             padding = ctx_ids.shape[-1] - ctx_len
             if padding > 0:
-                kv_rank = [
-                    [kv_rank[i][0][:, :, :-padding], kv_rank[i][1][:, :, :-padding]] for i in range(len(kv_rank))
-                ]
+                for i in range(len(kv_rank)):
+                    kv_rank.key_cache[i] = kv_rank.key_cache[i][:, :, :-padding]
+                    kv_rank.value_cache[i] = kv_rank.value_cache[i][:, :, :-padding]
 
         # Phase 2 from Star Attention: Global attention with online softmax
         qry_ids = self._tokenize(prompt_query)
