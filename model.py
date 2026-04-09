@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import os
-from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,79 +25,223 @@ from transformers.cache_utils import DynamicCache
 def compute_block_summaries(
     all_block_tokens: List[torch.Tensor],
     all_block_positions: List[torch.Tensor],
-    k: int = 32,
+    num_chunks: int = 4,
+    chunk_size: int = 32,
     method: str = "tfidf",
+    sink_size: int = 64,
+    embed_fn=None,
 ) -> List[Dict[str, torch.Tensor]]:
-    """Compute lightweight statistical summaries for each block.
+    """Compute block summaries by selecting the most informative contiguous chunks.
 
-    For each block, selects the top-k most informative tokens using
-    TF-IDF scoring (or random fallback). Each summary retains original
-    position IDs for RoPE compatibility.
+    Each block is divided into non-overlapping fixed-size chunks and each
+    chunk is scored as a unit using the chosen heuristic.  The top
+    ``num_chunks`` chunks are selected per block and returned in positional
+    order, preserving natural language structure so the Transformer
+    produces healthy K/V states.
+
+    Scoring is fully vectorized in PyTorch — no Python loops over tokens.
+
+    TF-IDF equivalence
+    ------------------
+    The naive formula ``score = mean_t(TF(t) * IDF(t))`` expands to::
+
+        (1 / chunk_len) * sum_{each token occurrence} IDF(token)
+
+    because every occurrence of token *t* contributes ``(1/chunk_len) * IDF(t)``,
+    and summing over unique types with their counts equals summing over all
+    positions.  This lets us replace the Counter + loop with a single
+    ``idf_table[chunk_tokens].sum() / chunk_len`` lookup.
 
     Args:
         all_block_tokens: list of 1D tensors, one per block (token IDs).
         all_block_positions: list of 1D tensors, one per block (position IDs).
-        k: number of summary tokens per block.
-        method: "tfidf" or "random".
+        num_chunks: number of contiguous chunks / summary slots to select per block.
+        chunk_size: number of tokens per chunk (used by chunk-based methods).
+        method: scoring / selection heuristic — one of:
+
+            * ``tfidf``        – mean TF-IDF score per chunk (global rarity).
+            * ``bm25``         – BM25-scored chunks (length-normalised rarity).
+            * ``entropy``      – fraction of unique tokens per chunk (local
+              diversity / information density).  A chunk full of padding
+              or stop-word repetition scores near 0; a dense entity-rich
+              chunk scores near 1.
+            * ``max_idf``      – max IDF value of any token in the chunk
+              (keyword / needle detection).
+            * ``evenly_spaced``– select exactly ``num_chunks * chunk_size``
+              tokens at uniform intervals across the block.  Guarantees full
+              block coverage regardless of token scores.  Returns original
+              position IDs (sparse).
+            * ``mean_pool``    – divide block into ``num_chunks`` equal groups,
+              mean-pool the token embeddings in each group, and return the
+              pooled float vectors as ``'embeds'``.  Requires ``embed_fn``
+              (the model\'s ``embed_tokens`` layer).  Position IDs are the
+              median position of each group.
+
+        sink_size: number of leading tokens in the first block to exclude from
+            scoring (default 64).  These tokens are always injected by the
+            caller as attention sinks and must not consume summary slots.
+            Set to 0 to disable.
+        embed_fn: callable ``(token_ids: LongTensor[N]) -> FloatTensor[N, D]``.
+            Required when ``method='mean_pool'``, ignored otherwise.
 
     Returns:
-        List of dicts with keys 'token_ids' and 'pos_ids', each a 1D tensor.
+        List of dicts, one per block.  Each dict contains:
+
+        * ``'token_ids'`` (1D LongTensor) and ``'pos_ids'`` (1D LongTensor) –
+          for all methods **except** ``mean_pool``.
+        * ``'embeds'`` (2D FloatTensor ``[k, D]``) and ``'pos_ids'`` –
+          for ``mean_pool``.
     """
     num_blocks = len(all_block_tokens)
+    device = all_block_tokens[0].device
 
-    if method == "random":
-        summaries = []
-        for blk_tok, blk_pos in zip(all_block_tokens, all_block_positions):
-            actual_k = min(k, blk_tok.shape[0])
-            idx = torch.randperm(blk_tok.shape[0])[:actual_k].sort().values
-            summaries.append({
-                'token_ids': blk_tok[idx],
-                'pos_ids': blk_pos[idx],
-            })
-        return summaries
-
-    # ---------- TF-IDF scoring ----------
-    # Document frequency: how many blocks contain each token
-    df: Counter = Counter()
+    # ── Corpus-level document frequency as a dense tensor ──────────────────
+    # df_table[token_id] = number of blocks in which that token appears.
+    # We use the maximum token id across the entire corpus as the table size.
+    vocab_size = max(blk.max().item() for blk in all_block_tokens) + 1
+    df_table = torch.zeros(vocab_size, dtype=torch.float32, device=device)
     for blk_tok in all_block_tokens:
-        unique_tokens = blk_tok.unique().tolist()
-        df.update(unique_tokens)
+        # Mark each unique token in this block (binary, then accumulate)
+        unique_ids = blk_tok.unique()
+        df_table[unique_ids] += 1.0
 
-    summaries = []
-    for blk_tok, blk_pos in zip(all_block_tokens, all_block_positions):
-        tokens_list = blk_tok.tolist()
-        block_len = len(tokens_list)
-        # Term frequency within this block
-        tf: Counter = Counter(tokens_list)
+    # ── IDF table ──────────────────────────────────────────────────────────
+    # idf_table[t] = log(num_blocks / max(df(t), 1))
+    df_clamped = df_table.clamp(min=1.0)
+    idf_table = torch.log(torch.tensor(num_blocks, dtype=torch.float32, device=device) / df_clamped)
+    # Tokens that never appear get idf = log(num_blocks/1) which is the max; that's fine.
 
-        scores = torch.zeros(block_len, dtype=torch.float32)
-        for i, t in enumerate(tokens_list):
-            tf_val = tf[t] / block_len
-            idf_val = math.log(num_blocks / max(df[t], 1))
-            scores[i] = tf_val * idf_val
+    # ── Average chunk length (for BM25 length normalisation) ───────────────
+    # Computed once on CPU to avoid a device sync inside the loop.
+    if method == "bm25":
+        total_len = sum(blk.shape[0] for blk in all_block_tokens)
+        num_total_chunks = sum(
+            (blk.shape[0] + chunk_size - 1) // chunk_size for blk in all_block_tokens
+        )
+        avg_chunk_len = float(total_len) / max(num_total_chunks, 1)
+        k1, b = 1.2, 0.75
 
-        # --- Diminishing-returns penalty for repeated tokens ----------
-        # The n-th occurrence of the same token has its score divided by
-        # log2(1 + n), so: 1st → full, 2nd → /log2(3)≈0.63×,
-        # 3rd → /log2(4)=0.50×, etc.  This prevents blind duplication
-        # from dominating topk while still allowing positionally-
-        # important repeats (e.g. entity mentions in multihop chains)
-        # to survive when their base TF-IDF score is high enough.
-        occurrence_count: Counter = Counter()
-        for i, t in enumerate(tokens_list):
-            occurrence_count[t] += 1
-            n = occurrence_count[t]
-            if n > 1:
-                scores[i] = scores[i] / math.log2(1 + n)
+    # ── Score & select ──────────────────────────────────────────────────────
+    summaries: List[Dict[str, torch.Tensor]] = []
+    for block_idx, (blk_tok, blk_pos) in enumerate(zip(all_block_tokens, all_block_positions)):
+        # Skip the first sink_size tokens of block 0 so they never compete
+        # for summary slots — they are always injected by the caller.
+        if block_idx == 0 and sink_size > 0:
+            skip = min(sink_size, blk_tok.shape[0])
+            blk_tok = blk_tok[skip:]
+            blk_pos = blk_pos[skip:]
 
-        actual_k = min(k, block_len)
-        _, top_indices = torch.topk(scores, actual_k)
-        top_indices = top_indices.sort().values  # maintain positional order
+        block_len = blk_tok.shape[0]
 
-        summaries.append({
-            'token_ids': blk_tok[top_indices],
-            'pos_ids': blk_pos[top_indices],
-        })
+        # ── Evenly-Spaced Token Selection ────────────────────────────────────
+        # Select exactly `num_chunks * chunk_size` token positions at uniform
+        # intervals across the block.  Guarantees full block coverage without
+        # any IDF scoring.  Original (sparse) position IDs are preserved.
+        if method == "evenly_spaced":
+            budget = num_chunks * chunk_size
+            if block_len <= budget:
+                # Block shorter than budget — take everything
+                summaries.append({'token_ids': blk_tok, 'pos_ids': blk_pos})
+            else:
+                # linspace gives `budget` evenly-spaced indices in [0, block_len-1]
+                idx = torch.linspace(0, block_len - 1, budget).long()
+                summaries.append({
+                    'token_ids': blk_tok[idx],
+                    'pos_ids':   blk_pos[idx],
+                })
+            continue  # skip chunk-split / IDF scoring entirely
+
+        # ── Mean-Pool Embedding Groups ────────────────────────────────────────
+        # Divide the block into `num_chunks` equal-ish groups; mean-pool the
+        # token embeddings in each group to produce a soft summary vector.
+        # Returns 'embeds' (FloatTensor [k, D]) instead of 'token_ids'.
+        # Position of each pooled vector = median position within its group.
+        # Requires embed_fn (the model's embed_tokens layer).
+        if method == "mean_pool":
+            if embed_fn is None:
+                raise ValueError("method='mean_pool' requires embed_fn to be provided.")
+            group_indices = torch.chunk(torch.arange(block_len, device=blk_tok.device), num_chunks)
+            pooled_embeds, pooled_pos = [], []
+            for g_idx in group_indices:
+                if g_idx.numel() == 0:
+                    continue
+                g_tok = blk_tok[g_idx].to(next(embed_fn.parameters()).device)
+                with torch.no_grad():
+                    g_emb = embed_fn(g_tok)                          # (g_len, D)
+                pooled_embeds.append(g_emb.mean(dim=0))              # (D,)
+                pooled_pos.append(blk_pos[g_idx[g_idx.numel() // 2]])  # median pos
+            summaries.append({
+                'embeds':  torch.stack(pooled_embeds),               # (k, D)
+                'pos_ids': torch.stack(pooled_pos).to(blk_pos),     # (k,)
+            })
+            continue  # skip chunk-split / IDF scoring entirely
+
+        # ── Chunk-split (shared by all IDF-based methods) ────────────────────
+        tok_chunks = blk_tok.split(chunk_size)   # tuple of 1-D tensors
+        pos_chunks = blk_pos.split(chunk_size)
+        n_chunks = len(tok_chunks)
+
+        if method == "bm25":
+            # ── Vectorized BM25 ──────────────────────────────────────────
+            # For each chunk: score = Σ_t IDF(t) * tf_norm(t)
+            # where tf_norm(t) = raw_tf*(k1+1) / (raw_tf + k1*(1-b+b*c_len/avg_len))
+            scores = torch.zeros(n_chunks, dtype=torch.float32, device=device)
+            for ci, c_tok in enumerate(tok_chunks):
+                c_len = c_tok.shape[0]
+                # raw term frequencies via bincount (GPU-native)
+                tf_raw = torch.bincount(c_tok, minlength=vocab_size).float()  # (vocab_size,)
+                mask = tf_raw > 0
+                tf_r = tf_raw[mask]
+                # BM25 uses its own IDF formula (different from TF-IDF's log(N/df))
+                df_r = df_table[mask]
+                idf_bm25 = torch.log(
+                    (num_blocks - df_r + 0.5) / (df_r + 0.5) + 1.0
+                )
+                numerator = tf_r * (k1 + 1)
+                denominator = tf_r + k1 * (1 - b + b * c_len / avg_chunk_len)
+                scores[ci] = (idf_bm25 * numerator / denominator).sum()
+        elif method == "entropy":
+            # ── Vectorized Token Entropy (Information Density) ───────────
+            # score(chunk) = unique_token_count / chunk_len
+            #
+            # Intuition: unique_count / L  ≈  type-token ratio, a fast proxy
+            # for lexical diversity.  A chunk of padding / repeated stop-words
+            # has unique_count → 1, score → 0.  A chunk packed with distinct
+            # entities scores near 1.  torch.bincount gives unique_count as
+            # (bin_counts > 0).sum() — no Python loop, no .tolist().
+            scores = torch.stack([
+                (torch.bincount(c_tok, minlength=vocab_size) > 0).sum().float()
+                / c_tok.shape[0]
+                for c_tok in tok_chunks
+            ])
+        elif method == "max_idf":
+            # ── Vectorized Max-IDF (Keyword / Needle Detection) ──────────
+            # score(chunk) = max IDF across all token positions in the chunk.
+            # One hyper-rare token (UUID, proper name, NIAH needle) is enough
+            # to bring the whole chunk to the top, regardless of surrounding
+            # filler.  Pure gather + reduce — no Python loop.
+            scores = torch.stack([
+                idf_table[c_tok].max()
+                for c_tok in tok_chunks
+            ])
+        else:
+            # ── Vectorized TF-IDF (default) ──────────────────────────────
+            # score(chunk) = sum_{pos} IDF(token[pos]) / chunk_len
+            # This is mathematically identical to mean(TF(t)*IDF(t)) over types.
+            scores = torch.stack([
+                idf_table[c_tok].sum() / c_tok.shape[0]
+                for c_tok in tok_chunks
+            ])
+
+        # Select top-k chunks, restore positional order
+        actual_k = min(num_chunks, n_chunks)
+        _, top_idx = torch.topk(scores, actual_k)
+        top_idx = top_idx.sort().values
+
+        idx_list = top_idx.tolist()
+        sel_tok = torch.cat([tok_chunks[i] for i in idx_list])
+        sel_pos = torch.cat([pos_chunks[i] for i in idx_list])
+        summaries.append({'token_ids': sel_tok, 'pos_ids': sel_pos})
 
     return summaries
 
@@ -268,15 +410,19 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         stop_words: Optional[List[str]] = None,
         block_size: int = -1,
         anchor_block_size: int = -1,
-        summary_k: int = 32,
+        summary_chunks: int = 4,
+        chunk_size: int = 32,
         summary_method: str = "tfidf",
         discard_summary_kv: bool = True,
+        sink_size: int = 64,
     ):
         super().__init__(path, max_new_tokens, stop_words=stop_words,
                          block_size=block_size, anchor_block_size=anchor_block_size)
-        self.summary_k = summary_k
+        self.summary_chunks = summary_chunks
+        self.chunk_size = chunk_size
         self.summary_method = summary_method
         self.discard_summary_kv = discard_summary_kv
+        self.sink_size = sink_size
 
     def _tokenize_and_partition_context(self, ctx):
         # Tokenize the context
@@ -296,16 +442,24 @@ class StarAttentionModel(DistributedInferenceBaseModel):
 
         return ctx_ids, position_ids, ctx_len
 
-    def _process_blockwise_context(self, ctx_ids_blocks, position_ids_blocks, block_summaries=None):
+    def _process_blockwise_context(
+        self,
+        ctx_ids_blocks,
+        position_ids_blocks,
+        block_summaries=None,
+        sink_ids: Optional[torch.Tensor] = None,
+        sink_pos: Optional[torch.Tensor] = None,
+    ):
         """Phase 1 of Star Attention: Blockwise Context Encoding with
         Statistical Block Summaries.
 
         Each block's input context is assembled as:
-            [S_1, ..., S_(i-1), B_i]
-        Only summaries from earlier blocks are prepended (S_post is
-        omitted because the causal mask prevents B_i from attending to
-        tokens at higher sequence indices).  The sequence is sorted by
-        position_id for flash-attention monotonicity, and after the
+            [SINK | S_1, ..., S_(i-1), B_i]  (for i > 0)
+            [B_0]                             (for i = 0, sinks already inside)
+        SINK = the first ``sink_size`` tokens of the sequence.  They are
+        always visible so every block can form stable attention-sink keys.
+        Summaries from later blocks are omitted (causal mask).  The full
+        concatenation is monotonically sorted by position_id and after the
         forward pass only B_i's KV states are retained.
         """
 
@@ -325,55 +479,106 @@ class StarAttentionModel(DistributedInferenceBaseModel):
                 global_block_idx = blocks_before_rank + idx
 
                 # Collect only pre-block summaries (j < i)
-                pre_token_parts, pre_pos_parts = [], []
+                pre_parts = []   # each element: dict with 'token_ids'|'embeds' + 'pos_ids'
                 for j in range(global_block_idx):
-                    s = block_summaries[j]
-                    pre_token_parts.append(s['token_ids'])
-                    pre_pos_parts.append(s['pos_ids'])
+                    pre_parts.append(block_summaries[j])
 
-                # Assemble: [S_pre | B_i]
-                all_tok = []
+                # Check whether any summary uses soft embeddings (mean_pool)
+                has_embeds = any('embeds' in s for s in pre_parts)
+
+                # Assemble: [SINK | S_pre | B_i]
                 all_pos = []
-                pre_len = 0
-                if pre_token_parts:
-                    pre_tok = torch.cat(pre_token_parts).unsqueeze(0).to(ctx_block.device)
-                    pre_pos = torch.cat(pre_pos_parts).unsqueeze(0).to(position_block.device)
-                    pre_len = pre_tok.shape[-1]
-                    all_tok.append(pre_tok)
-                    all_pos.append(pre_pos)
 
-                all_tok.append(ctx_block)
-                all_pos.append(position_block)
+                if has_embeds:
+                    # ── Soft-embedding path (mean_pool summaries) ────────────
+                    # Everything must be in embedding space so we pass
+                    # inputs_embeds instead of input_ids.
+                    embed_layer = self.model.model.embed_tokens
+                    all_emb = []
 
-                ctx_block = torch.cat(all_tok, dim=-1)
-                position_block = torch.cat(all_pos, dim=-1)
-                summary_len = ctx_block.shape[-1] - block_size_cur
+                    # 1. Attention sinks
+                    if global_block_idx > 0 and sink_ids is not None:
+                        s_emb = embed_layer(sink_ids.to(ctx_block.device))  # (sink_len, D)
+                        all_emb.append(s_emb.unsqueeze(0))                  # (1, sink_len, D)
+                        all_pos.append(sink_pos.unsqueeze(0).to(position_block.device))
 
-            # ---------- Sort by position_id for flash-attn compatibility ----------
-            # Flash attention checks for monotonically non-decreasing position_ids;
-            # non-monotonic ids trigger varlen multi-sequence segmentation which
-            # would incorrectly split our single-sequence context.
+                    # 2. Pre-block summaries
+                    for s in pre_parts:
+                        if 'embeds' in s:
+                            e = s['embeds'].to(ctx_block.device)            # (k, D)
+                        else:
+                            e = embed_layer(s['token_ids'].to(ctx_block.device))  # (n, D)
+                        all_emb.append(e.unsqueeze(0))                      # (1, n/k, D)
+                        all_pos.append(s['pos_ids'].unsqueeze(0).to(position_block.device))
+
+                    # 3. Current block
+                    b_emb = embed_layer(ctx_block)                          # (1, block_size, D)
+                    all_emb.append(b_emb)
+                    all_pos.append(position_block)
+
+                    inputs_embeds_block = torch.cat(all_emb, dim=1)         # (1, total_len, D)
+                    position_block = torch.cat(all_pos, dim=-1)
+                    summary_len = inputs_embeds_block.shape[1] - block_size_cur
+                    ctx_block = None  # signal to use inputs_embeds below
+                else:
+                    # ── Token-ID path (all other methods) ───────────────────
+                    all_tok = []
+                    inputs_embeds_block = None
+
+                    # 1. Attention sinks
+                    if global_block_idx > 0 and sink_ids is not None:
+                        all_tok.append(sink_ids.unsqueeze(0).to(ctx_block.device))
+                        all_pos.append(sink_pos.unsqueeze(0).to(position_block.device))
+
+                    # 2. Pre-block summaries
+                    if pre_parts:
+                        pre_tok = torch.cat([s['token_ids'] for s in pre_parts]).unsqueeze(0).to(ctx_block.device)
+                        pre_pos = torch.cat([s['pos_ids']   for s in pre_parts]).unsqueeze(0).to(position_block.device)
+                        all_tok.append(pre_tok)
+                        all_pos.append(pre_pos)
+
+                    # 3. Current block
+                    all_tok.append(ctx_block)
+                    all_pos.append(position_block)
+
+                    ctx_block = torch.cat(all_tok, dim=-1)
+                    position_block = torch.cat(all_pos, dim=-1)
+                    summary_len = ctx_block.shape[-1] - block_size_cur
+            else:
+                inputs_embeds_block = None
+
+            # ---------- B_i mask for KV extraction ----------
             if summary_len > 0:
-                # Mark B_i tokens before sorting (B_i sits at [pre_len .. pre_len+block_size_cur))
-                is_bi = torch.zeros(ctx_block.shape[-1], dtype=torch.bool, device=ctx_block.device)
-                is_bi[pre_len:pre_len + block_size_cur] = True
-
-                sort_idx = position_block.squeeze(0).argsort(stable=True)
-                ctx_block = ctx_block[:, sort_idx]
-                position_block = position_block[:, sort_idx]
-                is_bi_sorted = is_bi[sort_idx]
+                total_len = (
+                    inputs_embeds_block.shape[1] if inputs_embeds_block is not None
+                    else ctx_block.shape[-1]
+                )
+                is_bi_sorted = torch.zeros(total_len, dtype=torch.bool,
+                                           device=(inputs_embeds_block.device
+                                                   if inputs_embeds_block is not None
+                                                   else ctx_block.device))
+                is_bi_sorted[-block_size_cur:] = True
             else:
                 is_bi_sorted = None
 
             # ---------- Forward ----------
             with torch.no_grad():
-                kv_block = self.model(
-                    ctx_block,
-                    position_ids=position_block,
-                    use_cache=True,
-                    num_ring_steps=0,  # disable ring attention (local blockwise attention)
-                    enable_star_attn=False,
-                ).past_key_values  # type: ignore
+                if inputs_embeds_block is not None:
+                    kv_block = self.model(
+                        inputs_embeds=inputs_embeds_block,
+                        position_ids=position_block,
+                        use_cache=True,
+                        num_ring_steps=0,
+                        enable_star_attn=False,
+                    ).past_key_values  # type: ignore
+                else:
+                    kv_block = self.model(
+                        ctx_block,
+                        position_ids=position_block,
+                        use_cache=True,
+                        num_ring_steps=0,  # disable ring attention (local blockwise attention)
+                        enable_star_attn=False,
+                    ).past_key_values  # type: ignore
 
             # ---------- Extract only B_i's KV entries ----------
             if is_bi_sorted is not None and self.discard_summary_kv:
@@ -429,16 +634,34 @@ class StarAttentionModel(DistributedInferenceBaseModel):
             flat_block_tokens[-1] = flat_block_tokens[-1][:-padding]
             flat_block_positions[-1] = flat_block_positions[-1][:-padding]
 
+        # Extract attention sink tokens from the very start of the sequence.
+        # These are always re-injected into every block's context (except block 0
+        # which already contains them) so that attention sinks remain visible.
+        sink_size = min(self.sink_size, flat_block_tokens[0].shape[0]) if self.sink_size > 0 else 0
+        if sink_size > 0:
+            sink_ids = flat_block_tokens[0][:sink_size].to(self.model.device)
+            sink_pos = flat_block_positions[0][:sink_size].to(self.model.device)
+        else:
+            sink_ids = sink_pos = None
+
         block_summaries = compute_block_summaries(
             flat_block_tokens,
             flat_block_positions,
-            k=self.summary_k,
+            num_chunks=self.summary_chunks,
+            chunk_size=self.chunk_size,
             method=self.summary_method,
+            sink_size=sink_size,
+            embed_fn=self.model.model.embed_tokens if self.summary_method == "mean_pool" else None,
         )
 
         # Phase 1: Generate the KV cache for the local context (with summaries)
-        kv_rank = self._process_blockwise_context(ctx_ids_blocks, position_ids_blocks,
-                                                   block_summaries=block_summaries)
+        kv_rank = self._process_blockwise_context(
+            ctx_ids_blocks,
+            position_ids_blocks,
+            block_summaries=block_summaries,
+            sink_ids=sink_ids,
+            sink_pos=sink_pos,
+        )
         if self.rank == self.world_size - 1:  # discard padding from the last rank
             padding = ctx_ids.shape[-1] - ctx_len
             if padding > 0:

@@ -176,6 +176,15 @@ class StarLlamaFlashAttention2(LlamaFlashAttention2):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
+        # During Phase 2 (star attention), non-final ranks hold only
+        # preceding context in their KV cache. The query tokens should
+        # attend to the *entire* local cache, but FA2's bottom-right
+        # causal mask blocks the last (seqlen_q - 1) context tokens
+        # for the first query token. Force causal=False on these ranks.
+        effective_is_causal = self.is_causal
+        if enable_star_attn and RANK != WORLD_SIZE - 1:
+            effective_is_causal = False
+
         attn_output = _flash_attention_forward(
             query_states,
             key_states,
@@ -186,7 +195,7 @@ class StarLlamaFlashAttention2(LlamaFlashAttention2):
             dropout=dropout_rate,
             sliding_window=getattr(self, "sliding_window", None),
             use_top_left_mask=self._flash_attn_uses_top_left_mask,
-            is_causal=self.is_causal,
+            is_causal=effective_is_causal,
             num_ring_steps=num_ring_steps,
             enable_star_attn=enable_star_attn,
         )

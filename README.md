@@ -1,10 +1,10 @@
 # Star Attention: Efficient LLM Inference over Long Sequences
 ## Extended with Statistical Cross-Attention Block Summaries
 
-This repository contains code based on the paper [Star Attention: Efficient LLM Inference over Long Sequences](https://arxiv.org/abs/2411.17116), extended with **Statistical Cross-Attention** — a method that replaces the fixed anchor block with lightweight TF-IDF block summaries to improve cross-block semantic awareness during parallel KV cache construction.
+This repository contains code based on the paper [Star Attention: Efficient LLM Inference over Long Sequences](https://arxiv.org/abs/2411.17116), extended with **Statistical Cross-Attention** — a method that replaces the fixed anchor block with lightweight statistical block summaries to improve cross-block semantic awareness during parallel KV cache construction.
 
 The method operates in two phases:
-1. **Phase 1 - Context Encoding**: The context tokens are processed using blockwise-local attention. Each block is augmented with statistical summaries (top-k TF-IDF tokens) from earlier blocks, providing global semantic hints while preserving parallelism.
+1. **Phase 1 - Context Encoding**: The context tokens are processed using blockwise-local attention. Each block is augmented with the top-scoring contiguous chunks from earlier blocks (selected via TF-IDF or BM25), providing global semantic hints while preserving parallelism.
 2. **Phase 2 - Query Processing and Token Generation**: The query and response tokens attend to all prior cached tokens through sequence-global attention (unchanged).
 
 Star Attention **improves the inference time by up to 11x** while **preserving 97-100% of accuracy**. The method is **compatible with most Transformer-based LLMs trained with global attention, operating seamlessly out-of-the-box without additional training/finetuning.** Furthermore, Star Attention is **orthogonal to other optimization methods**, including Flash Attention and KV cache compression techniques, allowing for potential combined enhancements.
@@ -101,6 +101,9 @@ This codebase contains the implementation of Star Attention in PyTorch using the
    - [RULER Setup](#ruler-setup)
    - [Downloading Models](#downloading-models)
 2. [Statistical Cross-Attention](#statistical-cross-attention)
+   - [How It Works](#how-it-works)
+   - [Configuration](#configuration)
+   - [Overhead](#overhead)
 3. [Launching Inference with Star Attention](#launching-inference-with-star-attention)
    - [RULER](#ruler)
    - [BABILong](#babilong)
@@ -108,9 +111,10 @@ This codebase contains the implementation of Star Attention in PyTorch using the
 4. [Two Phases of Star Attention](#two-phases-of-star-attention)
    - [Phase 1 - Context Encoding](#phase-1---context-encoding)
    - [Phase 2 - Query Processing and Token Generation](#phase-2---query-processing-and-token-generation)
-5. [Citation](#citation)
-6. [References](#references)
-7. [Contact/Getting Help](#contactgetting-help)
+5. [Repository Structure](#repository-structure)
+6. [Citation](#citation)
+7. [References](#references)
+8. [Contact/Getting Help](#contactgetting-help)
 
 
 ## Setup Instructions
@@ -147,28 +151,45 @@ To download a model from HuggingFace, use the script: [`scripts/download_hf_mode
 
 ## Statistical Cross-Attention
 
-Statistical Cross-Attention replaces the fixed anchor block with lightweight, non-neural summaries computed via TF-IDF scoring. During Phase 1, each block's context is augmented with the top-k most informative tokens from earlier blocks (future summaries are omitted due to causal masking):
+Statistical Cross-Attention replaces the fixed anchor block with lightweight, non-neural summaries. During Phase 1, each block's context is augmented with the most informative contiguous chunks from earlier blocks, providing cross-block semantic awareness while preserving parallelism.
+
+### How It Works
+
+Each block is divided into non-overlapping **fixed-size chunks** (default: 32 tokens each). Every chunk is scored as a unit using one of four heuristics:
+
+- **TF-IDF** (default): Computes mean per-token TF-IDF across the chunk, using corpus-level document frequencies computed over all blocks.
+- **BM25**: Scores each chunk using BM25 with `k1=1.2`, `b=0.75`, and average chunk length normalisation.
+- **Entropy**: Scores each chunk by `unique_token_count / chunk_len` — a vectorized proxy for lexical diversity. Chunks full of padding or repeated stop-words score near 0; entity-rich, information-dense chunks score near 1.
+- **Max-IDF**: Scores each chunk by the maximum IDF value of any token it contains. A single hyper-rare token (UUID, unusual name, NIAH needle) is sufficient to push the chunk to the top, even if the surrounding tokens are generic filler.
+
+The top `num_chunks` highest-scoring chunks per block are selected and returned **in positional order**, preserving natural language structure so the Transformer produces healthy K/V states. Each summary token retains its **original position ID** for RoPE compatibility.
+
+Only **pre-block summaries** are used — summaries from block $j$ are only prepended to block $i$ where $j < i$. This ensures compatibility with the causal mask.
 
 ```
-GPU0: [B0]                       # block 0
-GPU1: [S0 | B1]                  # summary of block 0 + block 1
-GPU2: [S0, S1 | B2]              # summaries of blocks 0-1 + block 2
-GPU3: [S0, S1, S2 | B3]          # summaries of blocks 0-2 + block 3
+GPU0: [B0]                           # block 0 (no summaries)
+GPU1: [S0 | B1]                      # chunks from block 0  + block 1
+GPU2: [S0, S1 | B2]                  # chunks from blocks 0-1 + block 2
+GPU3: [S0, S1, S2 | B3]              # chunks from blocks 0-2 + block 3
 ```
 
-Each summary token retains its **original position ID** for RoPE compatibility. After the forward pass, only `B_i`'s KV states are kept — summaries are discarded.
+After the forward pass, only `B_i`'s KV states are retained — all summary KV states are discarded by default.
 
 ### Configuration
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--summary_k` | `32` | Number of summary tokens per block |
-| `--summary_method` | `tfidf` | Token selection method (`tfidf` or `random`) |
+| `--summary_chunks` | `4` | Number of contiguous chunks to select per block |
+| `--chunk_size` | `32` | Number of tokens per summary chunk |
+| `--summary_method` | `tfidf` | Chunk scoring heuristic (`tfidf`, `bm25`, `entropy`, or `max_idf`) |
+| `--sink_size` | `64` | Number of leading tokens always injected as attention sinks into every block's context (set to `0` to disable) |
 | `--no_discard_summary_kv` | off | If set, keeps summary KV states in the final cache |
+
+The total number of summary tokens per block is `summary_chunks × chunk_size` (default: `4 × 32 = 128`).
 
 ### Overhead
 
-With `b=4096`, `k=32`, `m=16` blocks: each GPU processes at most `b + (m-1)*k = 4576` tokens (for the last block) — bounded at **~12% max compute overhead** vs baseline. Summary computation is `O(block_size)` per block, negligible vs transformer compute.
+With `b=4096`, `num_chunks=4`, `chunk_size=32`, `m=16` blocks: each GPU processes at most `b + (m-1) × num_chunks × chunk_size = 4096 + 15 × 128 = 6016` tokens (for the last block). Summary computation is `O(block_size)` per block, negligible vs transformer compute.
 
 ## Launching Inference with Star Attention
 
@@ -245,7 +266,8 @@ $ torchrun --nproc_per_node=4 run_star_attn_inference.py \
     --model_path <path_to_model> \
     --attn_type star \
     --block_size 4096 \
-    --summary_k 32 \
+    --summary_chunks 4 \
+    --chunk_size 32 \
     --summary_method tfidf \
     --tokens_to_generate <num_tokens_to_generate> \
     --stop_words <end_of_sequence_tokens> \
@@ -268,13 +290,13 @@ Given a system with $H$ hosts and an input sample with context $c$ followed by q
   <div align="center">
     $$c = [c_1, c_2, \ldots, c_n]$$
   </div>
-- For each block $c_i$, a statistical summary $S_i$ is computed using TF-IDF scoring, selecting the top-$k$ most informative tokens while preserving their original position IDs.
-- Each block is augmented with summaries from earlier blocks (future summaries are omitted because the causal mask prevents $c_i$ from attending to tokens at higher sequence indices):
+- For each block $c_i$, a statistical summary $S_i$ is computed by dividing $c_i$ into fixed-size chunks and selecting the top-scoring chunks using TF-IDF or BM25, preserving their original position IDs.
+- Each block is augmented with summaries from earlier blocks only (future summaries are omitted because the causal mask prevents $c_i$ from attending to tokens at higher sequence indices):
   <div align="center">
     $$c'_i = [S_1, \ldots, S_{i-1}, c_i]$$
   </div>
 - The augmented context blocks are distributed across the $H$ hosts, with each host attending only to its assigned blocks.
-  - After processing, each host stores **only** $c_i$'s KV cache — all summary KV states are discarded.
+  - After processing, each host stores **only** $c_i$'s KV cache — all summary KV states are discarded (unless `--no_discard_summary_kv` is set).
 
 ### Phase 2 - Query Processing and Token Generation
 
@@ -312,6 +334,34 @@ Given a system with $H$ hosts and an input sample with context $c$ followed by q
 
 This method ensures that attention scores are correctly normalized across all hosts, requiring only the communication of a single scalar (the sum of exponents, $s_h$) and a vector (the local attention output, $A_h$) per token.
 
+
+## Repository Structure
+
+```
+Statistical-Cross-Attention/
+├── model.py                        # Model classes and summary computation
+│   ├── compute_block_summaries()   # Chunk-based TF-IDF / BM25 scoring
+│   ├── DistributedInferenceBaseModel
+│   ├── StarAttentionModel          # Phase 1 & 2 with summaries
+│   ├── DenseAttentionModel         # Standard dense attention
+│   └── RingAttentionModel          # Ring attention baseline
+├── run_star_attn_inference.py      # CLI entry point for custom data
+├── run_ruler.py                    # RULER benchmark launcher
+├── run_babilong.py                 # BABILong benchmark launcher
+├── launch.sh                       # Example launch configurations
+├── star_attention/
+│   ├── modeling_llama.py           # Modified LlamaForCausalLM with Star/Ring attn
+│   ├── modeling_flash_attention_utils.py
+│   ├── star_flash_attn/            # Star attention flash kernels
+│   └── ring_flash_attn/            # Ring attention flash kernels
+├── ruler/                          # RULER benchmark data & evaluation
+├── babilong/                       # BABILong benchmark data & evaluation
+├── scripts/
+│   ├── download_hf_model.py        # Model download utility
+│   └── time_inference.py           # Inference timing script
+├── requirements.txt
+└── README.md
+```
 
 ## Citation
 ```
