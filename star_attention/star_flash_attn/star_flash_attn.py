@@ -36,6 +36,14 @@ def _star_flash_attn_forward(
         return_softmax=return_softmax,
     )
 
+    # Single-GPU: skip all_gather entirely
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        out = block_out.to(torch.float32)
+        lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+        out = out.to(q.dtype)
+        lse = lse.squeeze(dim=-1).transpose(1, 2)
+        return out, lse
+
     out_gather = [torch.zeros_like(block_out) for _ in range(dist.get_world_size())]
     lse_gather = [torch.zeros_like(block_lse) for _ in range(dist.get_world_size())]
     dist.all_gather(out_gather, block_out, async_op=False)
