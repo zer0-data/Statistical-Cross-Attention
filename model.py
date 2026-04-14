@@ -115,6 +115,9 @@ def compute_block_summaries(
     # Computed once on CPU to avoid a device sync inside the loop.
     if method == "bm25":
         total_len = sum(blk.shape[0] for blk in all_block_tokens)
+        # Exclude sink tokens from block 0 — they are skipped during chunk scoring
+        if sink_size > 0:
+            total_len -= min(sink_size, all_block_tokens[0].shape[0])
         num_total_chunks = sum(
             (blk.shape[0] + chunk_size - 1) // chunk_size for blk in all_block_tokens
         )
@@ -302,7 +305,17 @@ class DistributedInferenceBaseModel:
                 f'GPUs Assigned: {", ".join([str(x) for x in self.max_memory.keys()])}'
             )
         else:
-            raise RuntimeError('Distributed environment is not initialized!')
+            # Single-GPU fallback — no distributed environment required
+            self.world_size = 1
+            self.local_world_size = 1
+            self.rank = 0
+            self.local_rank = 0
+            if torch.cuda.is_available():
+                mem_gb = round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
+                self.max_memory = {0: f'{mem_gb}GB'}
+            else:
+                self.max_memory = {}
+            print('[model._init_distributed] Single-GPU mode (no distributed environment)')
 
     def _tokenize(self, text: str) -> torch.Tensor:
         """Tokenize the input text and return the token ids
@@ -370,6 +383,9 @@ class DistributedInferenceBaseModel:
             next_token_logits = outputs.logits[:, -1, :]
             next_tokens = torch.argmax(next_token_logits, dim=-1)
             output_seq = next_tokens if output_seq is None else torch.cat([output_seq, next_tokens])
+
+            if self.tokenizer.eos_token_id is not None and next_tokens.item() == self.tokenizer.eos_token_id:
+                break
 
             # Update the input_ids and position_ids for the next iteration
             input_ids = next_tokens.unsqueeze(0)
@@ -777,6 +793,9 @@ class DenseAttentionModel:
             next_token_logits = outputs.logits[:, -1, :]
             next_tokens = torch.argmax(next_token_logits, dim=-1)
             output_seq = next_tokens if output_seq is None else torch.cat([output_seq, next_tokens])
+
+            if self.tokenizer.eos_token_id is not None and next_tokens.item() == self.tokenizer.eos_token_id:
+                break
 
             # Update the input_ids and position_ids for the next iteration
             input_ids = next_tokens.unsqueeze(0)
