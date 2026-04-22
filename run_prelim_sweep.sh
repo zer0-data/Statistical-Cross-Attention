@@ -3,7 +3,10 @@
 # Model loads ONCE; hyperparameters mutate in-place between cells.
 #
 # Dimensions (all defaulted in run_prelim_babilong.py):
-#   summary_method : tfidf, bm25, entropy, max_idf
+#   summary_method : tfidf, bm25, entropy, max_idf, evenly_spaced
+#                    (evenly_spaced is the non-semantic baseline; mean_pool
+#                     is intentionally excluded because it ignores chunk_size
+#                     and has a different budget shape — run separately)
 #   summary_chunks : 4, 16, 32   (caps max summary budget at ~3072 tokens;
 #                                  the 4096 ceiling corresponds to K≈42)
 #   tasks          : qa1, qa3, qa5
@@ -17,7 +20,7 @@
 #   K=16 ->  1536 tokens
 #   K=32 ->  3072 tokens (~75% of 4096 cap)
 #
-# Total: 4 * 3 * 3 = 36 cells, all within one Python process.
+# Total: 5 * 3 * 3 = 45 cells, all within one Python process.
 #
 # Env overrides:
 #   MODEL_PATH    HF id or local path (default: meta-llama/Llama-3.1-8B-Instruct)
@@ -32,7 +35,7 @@ RESULTS_FILE="${RESULTS_FILE:-prelim_accuracies.txt}"
 
 python run_prelim_babilong.py \
   --model_path "$MODEL_PATH" \
-  --methods tfidf,bm25,entropy,max_idf \
+  --methods tfidf,bm25,entropy,max_idf,evenly_spaced \
   --summary_chunks 4,16,32 \
   --tasks qa1,qa3,qa5 \
   --block_size 4096 \

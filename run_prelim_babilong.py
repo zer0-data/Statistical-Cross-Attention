@@ -278,8 +278,18 @@ if __name__ == "__main__":
     # Sweep dimensions (CSV)
     parser.add_argument(
         "--methods",
-        default="tfidf,bm25,entropy,max_idf",
-        help="CSV list of summary methods to sweep",
+        default="tfidf,bm25,entropy,max_idf,evenly_spaced",
+        help=(
+            "CSV list of summary methods to sweep. Supported by the codebase: "
+            "tfidf, bm25, entropy, max_idf, evenly_spaced, mean_pool. "
+            "`evenly_spaced` is the non-semantic baseline and shares the same "
+            "num_chunks*chunk_size token budget as the scoring methods — "
+            "include it to know whether the scorers are actually doing work. "
+            "`mean_pool` ignores chunk_size (returns num_chunks pooled "
+            "embedding vectors per block), so it has a different budget shape "
+            "— run it separately with matched-compression K values rather "
+            "than bundling into this sweep."
+        ),
     )
     parser.add_argument(
         "--summary_chunks",
