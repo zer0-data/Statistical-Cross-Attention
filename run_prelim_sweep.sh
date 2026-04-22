@@ -4,10 +4,18 @@
 #
 # Dimensions (all defaulted in run_prelim_babilong.py):
 #   summary_method : tfidf, bm25, entropy, max_idf
-#   summary_chunks : 2, 4, 8
+#   summary_chunks : 4, 16, 32   (caps max summary budget at ~3072 tokens;
+#                                  the 4096 ceiling corresponds to K≈42)
 #   tasks          : qa1, qa3, qa5
 # Fixed:
 #   block_size=4096, sink_size=64, chunk_size=32, dataset_config=16k
+#
+# With 16K context and block_size=4096 there are 4 blocks; the last block
+# sees summaries from 3 prior blocks. Peak summary budget at the last block:
+#   max_budget = 3 * summary_chunks * chunk_size  =  96 * K
+#   K=4  ->   384 tokens
+#   K=16 ->  1536 tokens
+#   K=32 ->  3072 tokens (~75% of 4096 cap)
 #
 # Total: 4 * 3 * 3 = 36 cells, all within one Python process.
 #
@@ -25,7 +33,7 @@ RESULTS_FILE="${RESULTS_FILE:-prelim_accuracies.txt}"
 python run_prelim_babilong.py \
   --model_path "$MODEL_PATH" \
   --methods tfidf,bm25,entropy,max_idf \
-  --summary_chunks 2,4,8 \
+  --summary_chunks 4,16,32 \
   --tasks qa1,qa3,qa5 \
   --block_size 4096 \
   --sink_size 64 \

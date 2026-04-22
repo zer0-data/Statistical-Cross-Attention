@@ -283,8 +283,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--summary_chunks",
-        default="2,4,8",
-        help="CSV list of summary_chunks budgets to sweep",
+        default="4,16,32",
+        help=(
+            "CSV list of summary_chunks budgets to sweep. "
+            "With block_size=4096 and chunk_size=32 over a 16K context "
+            "(4 blocks, accumulation factor 3), max summary budget at the "
+            "last block = 3 * summary_chunks * chunk_size = 96 * K. "
+            "K=32 → 3072 tokens (~75% of a 4096 cap); K=42 → 4032 (cap)."
+        ),
     )
     parser.add_argument(
         "--tasks",
