@@ -278,13 +278,15 @@ if __name__ == "__main__":
     # Sweep dimensions (CSV)
     parser.add_argument(
         "--methods",
-        default="tfidf,bm25,entropy,max_idf,evenly_spaced",
+        default="anchor,tfidf,bm25,entropy,max_idf,evenly_spaced",
         help=(
             "CSV list of summary methods to sweep. Supported by the codebase: "
-            "tfidf, bm25, entropy, max_idf, evenly_spaced, mean_pool. "
+            "anchor, tfidf, bm25, entropy, max_idf, evenly_spaced, mean_pool. "
+            "`anchor` is NVIDIA's vanilla Star Attention — block 0 contributes "
+            "its first num_chunks*chunk_size tokens as the anchor, visible to "
+            "every later block. Included as the reference method to beat. "
             "`evenly_spaced` is the non-semantic baseline and shares the same "
-            "num_chunks*chunk_size token budget as the scoring methods — "
-            "include it to know whether the scorers are actually doing work. "
+            "num_chunks*chunk_size token budget as the scoring methods. "
             "`mean_pool` ignores chunk_size (returns num_chunks pooled "
             "embedding vectors per block), so it has a different budget shape "
             "— run it separately with matched-compression K values rather "

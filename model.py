@@ -76,6 +76,14 @@ def compute_block_summaries(
               pooled float vectors as ``'embeds'``.  Requires ``embed_fn``
               (the model\'s ``embed_tokens`` layer).  Position IDs are the
               median position of each group.
+            * ``anchor``       – NVIDIA Star Attention's original anchor-block
+              baseline.  Block 0 contributes the first
+              ``num_chunks * chunk_size`` tokens (after sink) as the anchor;
+              all other blocks contribute nothing.  Downstream this yields
+              ``[sink | anchor | B_i]`` for every i>0 — exactly the vanilla
+              Star Attention formulation, expressed as a summary method so
+              it can be swept alongside the statistical methods at matched
+              token budget.
 
         sink_size: number of leading tokens in the first block to exclude from
             scoring (default 64).  These tokens are always injected by the
@@ -135,6 +143,27 @@ def compute_block_summaries(
             blk_pos = blk_pos[skip:]
 
         block_len = blk_tok.shape[0]
+
+        # ── Vanilla Star Attention Anchor-Block Baseline ────────────────────
+        # Block 0 contributes its first (num_chunks * chunk_size) tokens as
+        # the "anchor" visible to every later block. All other blocks
+        # contribute an empty summary, so block i>0 sees [sink | anchor | B_i]
+        # — exactly NVIDIA Star Attention's original formulation, at matched
+        # token budget.
+        if method == "anchor":
+            if block_idx == 0:
+                budget = num_chunks * chunk_size
+                take = min(budget, block_len)
+                summaries.append({
+                    'token_ids': blk_tok[:take],
+                    'pos_ids':   blk_pos[:take],
+                })
+            else:
+                summaries.append({
+                    'token_ids': blk_tok.new_empty(0),
+                    'pos_ids':   blk_pos.new_empty(0),
+                })
+            continue  # skip chunk-split / IDF scoring entirely
 
         # ── Evenly-Spaced Token Selection ────────────────────────────────────
         # Select exactly `num_chunks * chunk_size` token positions at uniform
