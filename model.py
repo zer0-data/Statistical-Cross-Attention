@@ -466,14 +466,36 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         summary_method: str = "tfidf",
         discard_summary_kv: bool = True,
         sink_size: int = 64,
+        position_mode: str = "sparse",
     ):
+        """
+        position_mode: controls how RoPE position IDs are assigned during
+            Phase 1 when the assembled sequence contains [sink | summary | B_i]
+            for block i>0.
+
+            * ``sparse`` (default) – every token keeps its original global
+              position in the full context. Summary tokens appear at their
+              source-block positions, producing gaps where unselected tokens
+              were dropped. Preserves real inter-token distances for RoPE.
+            * ``contiguous`` – the assembled sequence is re-numbered 0..L-1
+              for each block's Phase 1 forward (NVIDIA Star Attention style).
+              No gaps; B_i for every i>0 sits at the same local range
+              [sink+summary..L-1]. Phase 2 query positions are shifted so
+              the query sits just past the longest assembled Phase-1 length,
+              giving in-distribution RoPE deltas to every block's KV.
+        """
         super().__init__(path, max_new_tokens, stop_words=stop_words,
                          block_size=block_size, anchor_block_size=anchor_block_size)
+        if position_mode not in ("sparse", "contiguous"):
+            raise ValueError(
+                f"position_mode must be 'sparse' or 'contiguous', got {position_mode!r}"
+            )
         self.summary_chunks = summary_chunks
         self.chunk_size = chunk_size
         self.summary_method = summary_method
         self.discard_summary_kv = discard_summary_kv
         self.sink_size = sink_size
+        self.position_mode = position_mode
 
     def _tokenize_and_partition_context(self, ctx):
         # Tokenize the context
@@ -569,6 +591,17 @@ class StarAttentionModel(DistributedInferenceBaseModel):
 
                     inputs_embeds_block = torch.cat(all_emb, dim=1)         # (1, total_len, D)
                     position_block = torch.cat(all_pos, dim=-1)
+                    if self.position_mode == "contiguous":
+                        # Re-number assembled sequence 0..L-1 (NVIDIA-style).
+                        # B_i for every block i>0 will land at the same local
+                        # range [sink+summary..L-1], making Phase 2 RoPE
+                        # deltas small and in-distribution.
+                        L = position_block.shape[-1]
+                        position_block = torch.arange(
+                            0, L,
+                            device=position_block.device,
+                            dtype=position_block.dtype,
+                        ).unsqueeze(0)
                     summary_len = inputs_embeds_block.shape[1] - block_size_cur
                     ctx_block = None  # signal to use inputs_embeds below
                 else:
@@ -594,6 +627,14 @@ class StarAttentionModel(DistributedInferenceBaseModel):
 
                     ctx_block = torch.cat(all_tok, dim=-1)
                     position_block = torch.cat(all_pos, dim=-1)
+                    if self.position_mode == "contiguous":
+                        # See has_embeds branch above for rationale.
+                        L = position_block.shape[-1]
+                        position_block = torch.arange(
+                            0, L,
+                            device=position_block.device,
+                            dtype=position_block.dtype,
+                        ).unsqueeze(0)
                     summary_len = ctx_block.shape[-1] - block_size_cur
             else:
                 inputs_embeds_block = None
@@ -720,9 +761,34 @@ class StarAttentionModel(DistributedInferenceBaseModel):
                     kv_rank.key_cache[i] = kv_rank.key_cache[i][:, :, :-padding]
                     kv_rank.value_cache[i] = kv_rank.value_cache[i][:, :, :-padding]
 
-        # Phase 2: Process query with global attention (unchanged)
+        # Phase 2: Process query with global attention
         qry_ids = self._tokenize(prompt_query)
-        qry_position_ids = torch.arange(ctx_len, ctx_len + qry_ids.shape[-1]).unsqueeze(0).to(self.model.device)
+
+        if self.position_mode == "contiguous":
+            # The query must sit just past the longest assembled Phase-1
+            # sequence so its RoPE deltas to every block's KV are small
+            # and positive. Under contiguous mode each block i was
+            # re-numbered 0..L_i-1, where L_i = sink + prior_summaries + B.
+            max_phase1_len = self.block_size   # block 0 has no prefix
+            cum_summary_len = 0
+            for i in range(len(block_summaries)):
+                if i > 0:
+                    L_i = sink_size + cum_summary_len + self.block_size
+                    if L_i > max_phase1_len:
+                        max_phase1_len = L_i
+                s = block_summaries[i]
+                summary_len_i = (
+                    s['token_ids'].shape[0] if 'token_ids' in s
+                    else s['embeds'].shape[0]
+                )
+                cum_summary_len += summary_len_i
+            qry_start = max_phase1_len
+        else:
+            qry_start = ctx_len
+
+        qry_position_ids = torch.arange(
+            qry_start, qry_start + qry_ids.shape[-1]
+        ).unsqueeze(0).to(self.model.device)
         output = self._generate_output(qry_ids, qry_position_ids, kv_rank)
 
         # Get the generated text
