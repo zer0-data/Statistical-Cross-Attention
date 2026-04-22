@@ -33,11 +33,21 @@ def _ring_flash_attn_forward(
     return_softmax,
     num_ring_steps,
 ):
-    comm = RingComm(process_group)
-    if num_ring_steps < 0:
-        num_ring_steps = comm.world_size - 1
-
-    assert num_ring_steps < comm.world_size
+    # Single-GPU / non-distributed: skip RingComm (which requires a live
+    # process group). With world_size==1, num_ring_steps==0 and the loop
+    # executes exactly once with no send/recv, so `comm` is never used.
+    single_gpu = not dist.is_initialized() or dist.get_world_size() == 1
+    if single_gpu:
+        comm = None
+        comm_rank = 0
+        if num_ring_steps < 0:
+            num_ring_steps = 0
+    else:
+        comm = RingComm(process_group)
+        comm_rank = comm.rank
+        if num_ring_steps < 0:
+            num_ring_steps = comm.world_size - 1
+        assert num_ring_steps < comm.world_size
 
     out = None
     lse = None
@@ -50,7 +60,7 @@ def _ring_flash_attn_forward(
             next_v: torch.Tensor = comm.send_recv(v)
             comm.commit()
 
-        if not causal or step <= comm.rank:
+        if not causal or step <= comm_rank:
             params = get_default_args(_flash_attn_forward).copy()
             params.update(
                 {

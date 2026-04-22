@@ -76,6 +76,15 @@ def compute_block_summaries(
               pooled float vectors as ``'embeds'``.  Requires ``embed_fn``
               (the model\'s ``embed_tokens`` layer).  Position IDs are the
               median position of each group.
+            * ``anchor``       – NVIDIA Star Attention's original anchor-block
+              baseline.  Block 0 contributes its **entire** post-sink content
+              (block_size − sink_size tokens) as the anchor visible to every
+              later block; all other blocks contribute nothing.  Downstream
+              every block i>0 sees ``[sink | full_anchor | B_i]`` — exactly
+              the vanilla Star Attention formulation.  ``num_chunks`` and
+              ``chunk_size`` are **ignored** for this method, so sweeping them
+              is a no-op (returns identical results across K) — useful as a
+              determinism sanity check.
 
         sink_size: number of leading tokens in the first block to exclude from
             scoring (default 64).  These tokens are always injected by the
@@ -135,6 +144,32 @@ def compute_block_summaries(
             blk_pos = blk_pos[skip:]
 
         block_len = blk_tok.shape[0]
+
+        # ── Vanilla Star Attention Anchor-Block Baseline ────────────────────
+        # Block 0 contributes its entire post-sink content (block_size −
+        # sink_size tokens) as the "anchor" visible to every later block.
+        # All other blocks contribute an empty summary, so every block i>0
+        # sees [sink | full_anchor | B_i] — exactly NVIDIA Star Attention's
+        # original formulation.
+        #
+        # Note: num_chunks and chunk_size are IGNORED for this method. The
+        # anchor is always the full block 0. This means sweeping K across
+        # {4, 16, 32} will produce identical results for `anchor`; that
+        # redundancy serves as a determinism sanity check.
+        if method == "anchor":
+            if block_idx == 0:
+                # blk_tok / blk_pos have already been sink-stripped above
+                # (lines ~132-135), so they are exactly the anchor content.
+                summaries.append({
+                    'token_ids': blk_tok,
+                    'pos_ids':   blk_pos,
+                })
+            else:
+                summaries.append({
+                    'token_ids': blk_tok.new_empty(0),
+                    'pos_ids':   blk_pos.new_empty(0),
+                })
+            continue  # skip chunk-split / IDF scoring entirely
 
         # ── Evenly-Spaced Token Selection ────────────────────────────────────
         # Select exactly `num_chunks * chunk_size` token positions at uniform

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import torch
+import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
 from .utils import RingComm, update_out_and_lse, get_default_args, flatten_varlen_lse, unflatten_varlen_lse
 
@@ -38,11 +39,20 @@ def _ring_flash_attn_varlen_forward(
     block_table=None,
     leftpad_k=None,
 ):
-    comm = RingComm(process_group)
-    if num_ring_steps < 0:
-        num_ring_steps = comm.world_size - 1
-
-    assert num_ring_steps < comm.world_size
+    # Single-GPU / non-distributed: skip RingComm (see _ring_flash_attn_forward
+    # for the mirrored fix).
+    single_gpu = not dist.is_initialized() or dist.get_world_size() == 1
+    if single_gpu:
+        comm = None
+        comm_rank = 0
+        if num_ring_steps < 0:
+            num_ring_steps = 0
+    else:
+        comm = RingComm(process_group)
+        comm_rank = comm.rank
+        if num_ring_steps < 0:
+            num_ring_steps = comm.world_size - 1
+        assert num_ring_steps < comm.world_size
 
     out = None
     lse = None
@@ -54,7 +64,7 @@ def _ring_flash_attn_varlen_forward(
             next_k: torch.Tensor = comm.send_recv(k)
             next_v: torch.Tensor = comm.send_recv(v)
             comm.commit()
-        if not causal or step <= comm.rank:
+        if not causal or step <= comm_rank:
             params = get_default_args(_flash_attn_varlen_forward).copy()
             params.update(
                 {

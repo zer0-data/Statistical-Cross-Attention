@@ -278,13 +278,31 @@ if __name__ == "__main__":
     # Sweep dimensions (CSV)
     parser.add_argument(
         "--methods",
-        default="tfidf,bm25,entropy,max_idf",
-        help="CSV list of summary methods to sweep",
+        default="anchor,tfidf,bm25,entropy,max_idf,evenly_spaced",
+        help=(
+            "CSV list of summary methods to sweep. Supported by the codebase: "
+            "anchor, tfidf, bm25, entropy, max_idf, evenly_spaced, mean_pool. "
+            "`anchor` is NVIDIA's vanilla Star Attention — block 0 contributes "
+            "its first num_chunks*chunk_size tokens as the anchor, visible to "
+            "every later block. Included as the reference method to beat. "
+            "`evenly_spaced` is the non-semantic baseline and shares the same "
+            "num_chunks*chunk_size token budget as the scoring methods. "
+            "`mean_pool` ignores chunk_size (returns num_chunks pooled "
+            "embedding vectors per block), so it has a different budget shape "
+            "— run it separately with matched-compression K values rather "
+            "than bundling into this sweep."
+        ),
     )
     parser.add_argument(
         "--summary_chunks",
-        default="2,4,8",
-        help="CSV list of summary_chunks budgets to sweep",
+        default="4,16,32",
+        help=(
+            "CSV list of summary_chunks budgets to sweep. "
+            "With block_size=4096 and chunk_size=32 over a 16K context "
+            "(4 blocks, accumulation factor 3), max summary budget at the "
+            "last block = 3 * summary_chunks * chunk_size = 96 * K. "
+            "K=32 → 3072 tokens (~75% of a 4096 cap); K=42 → 4032 (cap)."
+        ),
     )
     parser.add_argument(
         "--tasks",
