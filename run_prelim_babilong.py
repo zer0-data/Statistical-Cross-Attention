@@ -72,6 +72,7 @@ def run_cell(
     sink_size: int,
     anchor_block_size: int,
     discard_summary_kv: bool,
+    position_mode: str,
     start_sample_index: int,
     num_samples: int,
     results_file: str,
@@ -87,6 +88,7 @@ def run_cell(
     model.sink_size = sink_size
     model.discard_summary_kv = discard_summary_kv
     model.block_size = block_size
+    model.position_mode = position_mode
     # anchor_block_size: None => model defaults to block_size
     model.anchor_block_size = anchor_block_size if anchor_block_size > 0 else None
 
@@ -98,7 +100,7 @@ def run_cell(
     print(
         f"\n>>> task={task} method={method} chunks={summary_chunks} "
         f"chunk_size={chunk_size} block={block_size} sink={sink_size} "
-        f"-> {total_samples} samples"
+        f"pos={position_mode} -> {total_samples} samples"
     )
 
     for idx, i in enumerate(range(start_sample_index, end_idx)):
@@ -150,7 +152,7 @@ def run_cell(
 
     accuracy = correct / total * 100
     print(
-        f"    === {task}/{method}/chunks={summary_chunks}: "
+        f"    === {task}/{method}/chunks={summary_chunks}/pos={position_mode}: "
         f"{accuracy:.2f}% ({correct}/{total}) ==="
     )
 
@@ -165,6 +167,7 @@ def run_cell(
         f"anchor_block_size={anchor_block_size} | "
         f"sink_size={sink_size} | "
         f"discard_summary_kv={discard_summary_kv} | "
+        f"position_mode={position_mode} | "
         f"samples=start:{start_sample_index},n:{num_samples} | "
         f"correct={correct}/{total} | "
         f"accuracy={accuracy:.2f}%\n"
@@ -184,6 +187,13 @@ def main(args):
     methods = _csv(args.methods)
     chunk_budgets = _csv_int(args.summary_chunks)
     tasks = _csv(args.tasks)
+    position_modes = _csv(args.position_modes)
+    for pm in position_modes:
+        if pm not in ("sparse", "contiguous"):
+            raise ValueError(
+                f"position_modes entries must be 'sparse' or 'contiguous', "
+                f"got {pm!r}"
+            )
 
     print("=" * 68)
     print("  Statistical Cross-Attention — BABILong Prelim Sweep")
@@ -193,6 +203,7 @@ def main(args):
     print(f"  Tasks            : {tasks}")
     print(f"  Summary methods  : {methods}")
     print(f"  Summary chunks   : {chunk_budgets}")
+    print(f"  Position modes   : {position_modes}")
     print(f"  chunk_size       : {args.chunk_size}")
     print(f"  block_size       : {args.block_size}")
     print(f"  sink_size        : {args.sink_size}")
@@ -201,7 +212,7 @@ def main(args):
           f"(start_index={args.start_sample_index})")
     print(f"  results_file     : {args.results_file}")
     print(f"  total cells      : "
-          f"{len(methods) * len(chunk_budgets) * len(tasks)}")
+          f"{len(methods) * len(chunk_budgets) * len(tasks) * len(position_modes)}")
     print("=" * 68)
 
     # --- 1. Load datasets (one per task, reused across all cells of that task) ---
@@ -231,38 +242,41 @@ def main(args):
         summary_method=methods[0],
         discard_summary_kv=not args.no_discard_summary_kv,
         sink_size=args.sink_size,
+        position_mode=position_modes[0],
     )
 
     # --- 3. Sweep ---
     print("\n--- 3. Sweeping ---")
-    total_cells = len(methods) * len(chunk_budgets) * len(tasks)
+    total_cells = len(methods) * len(chunk_budgets) * len(tasks) * len(position_modes)
     cell_idx = 0
-    for method in methods:
-        for chunks in chunk_budgets:
-            for task in tasks:
-                cell_idx += 1
-                print(f"\n--- [{cell_idx}/{total_cells}] ---")
-                run_cell(
-                    model,
-                    datasets_by_task[task],
-                    task=task,
-                    method=method,
-                    summary_chunks=chunks,
-                    chunk_size=args.chunk_size,
-                    block_size=args.block_size,
-                    sink_size=args.sink_size,
-                    anchor_block_size=args.anchor_block_size,
-                    discard_summary_kv=not args.no_discard_summary_kv,
-                    start_sample_index=args.start_sample_index,
-                    num_samples=args.num_samples,
-                    results_file=args.results_file,
-                    model_tag=args.model_path,
-                    dataset_config=args.dataset_config,
-                )
-                # Extra cleanup between cells — release any lingering CUDA
-                # allocator blocks from the previous summary_method / cache
-                # layout so the next cell starts fresh.
-                _reset_cuda()
+    for pm in position_modes:
+        for method in methods:
+            for chunks in chunk_budgets:
+                for task in tasks:
+                    cell_idx += 1
+                    print(f"\n--- [{cell_idx}/{total_cells}] ---")
+                    run_cell(
+                        model,
+                        datasets_by_task[task],
+                        task=task,
+                        method=method,
+                        summary_chunks=chunks,
+                        chunk_size=args.chunk_size,
+                        block_size=args.block_size,
+                        sink_size=args.sink_size,
+                        anchor_block_size=args.anchor_block_size,
+                        discard_summary_kv=not args.no_discard_summary_kv,
+                        position_mode=pm,
+                        start_sample_index=args.start_sample_index,
+                        num_samples=args.num_samples,
+                        results_file=args.results_file,
+                        model_tag=args.model_path,
+                        dataset_config=args.dataset_config,
+                    )
+                    # Extra cleanup between cells — release any lingering CUDA
+                    # allocator blocks from the previous summary_method / cache
+                    # layout so the next cell starts fresh.
+                    _reset_cuda()
 
     print("\n" + "=" * 68)
     print(f"  Sweep complete. {total_cells} cells appended to {args.results_file}")
@@ -321,6 +335,18 @@ if __name__ == "__main__":
         help="-1 => default to block_size",
     )
     parser.add_argument("--no_discard_summary_kv", action="store_true")
+    parser.add_argument(
+        "--position_modes",
+        default="sparse,contiguous",
+        help=(
+            "CSV list of position-mode values to sweep: 'sparse' and/or "
+            "'contiguous'. sparse keeps global position IDs (gaps at chunk "
+            "boundaries); contiguous re-numbers each Phase-1 assembled "
+            "sequence 0..L-1 (NVIDIA Star Attention style), and shifts the "
+            "Phase-2 query past the longest assembled length so RoPE deltas "
+            "stay in-distribution. Default sweeps both as an ablation axis."
+        ),
+    )
 
     # Generation
     parser.add_argument("--max_new_tokens", type=int, default=64)
