@@ -447,6 +447,31 @@ class DistributedInferenceBaseModel:
         raise NotImplementedError
 
 
+def _to_kv_list(kv):
+    """Normalise any KV cache format to a mutable list-of-lists.
+
+    Accepts:
+      * DynamicCache (HF transformers ≥4.36)
+      * tuple-of-tuples  ((K0,V0), (K1,V1), ...)  – legacy HF format
+      * list-of-tuples or list-of-lists             – already partially normalised
+
+    Returns [[K_layer0, V_layer0], [K_layer1, V_layer1], ...] where each
+    inner list is mutable so callers can set elements to None to release
+    GPU memory eagerly.
+
+    For DynamicCache the internal key_cache / value_cache lists are cleared
+    immediately so the CUDA allocator sees the correct refcount as soon as
+    the caller drops its reference to the returned list entries.
+    """
+    if isinstance(kv, DynamicCache):
+        out = [[kv.key_cache[i], kv.value_cache[i]] for i in range(len(kv))]
+        kv.key_cache.clear()
+        kv.value_cache.clear()
+        return out
+    # tuple-of-tuples, list-of-tuples, or already list-of-lists
+    return [[layer[0], layer[1]] for layer in kv]
+
+
 class StarAttentionModel(DistributedInferenceBaseModel):
     """Star Attention - Phase 1 and Phase 2
 
@@ -631,19 +656,55 @@ class StarAttentionModel(DistributedInferenceBaseModel):
                         enable_star_attn=False,
                     ).past_key_values  # type: ignore
 
+            # ---------- Normalise kv_block to mutable list-of-lists ----------
+            # past_key_values may come back as a DynamicCache (HF ≥4.36) or
+            # as a legacy tuple-of-tuples depending on the model variant.
+            # Convert to [[K_layer0, V_layer0], ...] so we can free tensors
+            # layer-by-layer later.  _to_kv_list clears the source container's
+            # internal references so the allocator sees the correct refcount.
+            kv_block = _to_kv_list(kv_block)
+
             # ---------- Extract only B_i's KV entries ----------
             if is_bi_sorted is not None and self.discard_summary_kv:
+                # Boolean indexing creates new tensors (not views); rebinding
+                # kv_block drops the reference to the full-seq originals.
                 kv_block = [
-                    [x[0][:, :, is_bi_sorted], x[1][:, :, is_bi_sorted]] for x in kv_block
+                    [kv_block[i][0][:, :, is_bi_sorted],
+                     kv_block[i][1][:, :, is_bi_sorted]]
+                    for i in range(len(kv_block))
                 ]
+                # Flush freed full-seq KV back to the allocator before the
+                # cat so it can be reused immediately.
+                torch.cuda.empty_cache()
 
-            kv_rank = (
-                kv_block
-                if not kv_rank
-                else [
-                    [torch.cat((kv_rank[i][j], kv_block[i][j]), dim=-2) for j in range(2)] for i in range(len(kv_rank))
-                ]
-            )
+            if not kv_rank:
+                kv_rank = kv_block
+            else:
+                # Normalise kv_rank as well (DynamicCache on the first
+                # non-anchor block, list-of-lists thereafter).
+                kv_rank = _to_kv_list(kv_rank)
+
+                # Free old layers one-by-one while building the concatenated
+                # result.  The naive list-comprehension approach keeps the
+                # entire old kv_rank (≈ i × block_kv) AND the new result
+                # (≈ (i+1) × block_kv) alive simultaneously, which at 128K
+                # context with 32K blocks causes a ~32 GB transient spike.
+                # Freeing each old layer immediately after concatenating it
+                # caps the peak to roughly one layer's worth of KV at a time.
+                num_layers = len(kv_rank)
+                new_kv = [None] * num_layers
+                for layer_i in range(num_layers):
+                    new_kv[layer_i] = [
+                        torch.cat((kv_rank[layer_i][0], kv_block[layer_i][0]), dim=-2),
+                        torch.cat((kv_rank[layer_i][1], kv_block[layer_i][1]), dim=-2),
+                    ]
+                    # Drop per-layer references immediately.
+                    kv_rank[layer_i][0] = None
+                    kv_rank[layer_i][1] = None
+                    kv_block[layer_i][0] = None
+                    kv_block[layer_i][1] = None
+                del kv_rank, kv_block
+                kv_rank = new_kv
 
         # ---------- Wrap in DynamicCache ----------
         # kv_rank is a List[List[Tensor]] (or DynamicCache for single-block
@@ -654,6 +715,10 @@ class StarAttentionModel(DistributedInferenceBaseModel):
             cache = DynamicCache()
             for layer_idx in range(len(kv_rank)):
                 cache.update(kv_rank[layer_idx][0], kv_rank[layer_idx][1], layer_idx)
+                # Drop list reference immediately (tensors now owned by cache).
+                kv_rank[layer_idx][0] = None
+                kv_rank[layer_idx][1] = None
+            del kv_rank
             kv_rank = cache
 
         return kv_rank
