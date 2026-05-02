@@ -18,7 +18,7 @@ The anchor ensures all GPUs share a minimum overlapping context, which helps eac
 
 ### What We Changed
 
-We **removed the anchor block entirely**. The role of shared cross-block context is now served by two separate, more targeted mechanisms:
+We **replaced the anchor block as the default cross-block context mechanism**. The anchor remains available as a configurable `summary_method="anchor"` option for direct comparison; in our experiments it serves as the primary baseline to beat. The role of shared cross-block context is now served by two separate, more targeted mechanisms:
 
 1. **Attention sinks** — a small, fixed-size prefix (default 64 tokens) from the very start of the sequence.
 2. **Statistical block summaries** — informationally-scored contiguous chunks from earlier blocks, prepended to each block.
@@ -29,7 +29,7 @@ We **removed the anchor block entirely**. The role of shared cross-block context
 |---|---|
 | Always uses the first $N$ tokens regardless of content | Summaries select the *most informative* chunks from each block |
 | Fixed-size, does not scale with number of blocks | Summary budget is configurable per block (`num_chunks × chunk_size`) |
-| Duplicates the entire first block on every GPU | Sinks are tiny (64 tokens); summaries are compact (~128 tokens/block) |
+| Duplicates the entire first block on every GPU | Sinks are tiny (64 tokens); summaries are compact (~12.5% of block) |
 | No cross-block awareness beyond block 0 | Summaries carry scored information from *all* earlier blocks |
 
 ---
@@ -131,6 +131,24 @@ $$\text{score}(\text{chunk}) = \max_{t \in \text{chunk}} \text{IDF}(t)$$
 
 **When it works best**: Retrieval tasks (NIAH, multi-key retrieval) where a single rare identifier determines the answer. It is the most aggressive heuristic — it prioritises rare-token presence over general informativeness.
 
+### 4.5 Evenly Spaced (Non-Semantic Baseline)
+
+**Selection rule**: Select exactly `num_chunks × chunk_size` tokens at uniform intervals across the block, independent of content.
+
+**Why included**: Provides a **position-only baseline** with an identical token budget to the scoring methods. If a scoring heuristic cannot beat evenly-spaced sampling, the IDF/entropy signal adds no value over uniform coverage. It is the minimum bar every semantic method must clear.
+
+**When it works**: Long, uniformly dense documents where no region is more informative than any other. Performs poorly on retrieval tasks where the answer is localised.
+
+### 4.6 Mean Pool (Soft Embedding Summaries)
+
+**Mechanism**: Divide the block into `num_chunks` equal groups, mean-pool the token embeddings within each group, and return the pooled float vectors as soft embeddings. Unlike all other methods the summary is not a set of discrete token IDs but a set of continuous embedding vectors passed directly to the Transformer as `inputs_embeds`.
+
+**Budget shape differs**: Mean pool always returns exactly `num_chunks` vectors regardless of `chunk_size`. It has a fundamentally different compression ratio from the token-selection methods and should not be swept alongside them with matched `num_chunks` values — use matched-compression-ratio comparisons instead.
+
+**Why included**: Tests whether a learned, continuous representation of each region outperforms discrete token selection. Acts as an upper bound on what soft summarisation can achieve without a trained compressor.
+
+---
+
 ### Heuristic Comparison Summary
 
 | Heuristic | Signal | Strength | Weakness |
@@ -139,6 +157,8 @@ $$\text{score}(\text{chunk}) = \max_{t \in \text{chunk}} \text{IDF}(t)$$
 | **BM25** | Length-normalised rarity with TF saturation | Robust to variable chunk lengths | Slightly more compute (per-chunk bincount) |
 | **Entropy** | Local diversity (type-token ratio) | Corpus-independent, fast | Ignores global rarity entirely |
 | **Max-IDF** | Maximum single-token rarity | Perfect for needle detection | Over-indexes on one token; ignores overall chunk quality |
+| **Evenly spaced** | Uniform position coverage | Budget-matched non-semantic baseline | Ignores content entirely |
+| **Mean pool** | Continuous embedding average | Soft representation, no discretisation loss | Different budget shape; requires `inputs_embeds` path |
 
 ---
 
@@ -179,7 +199,9 @@ After the forward pass, a boolean mask `is_bi_sorted` identifies which KV positi
 
 ```python
 kv_block = [
-    [x[0][:, :, is_bi_sorted], x[1][:, :, is_bi_sorted]] for x in kv_block
+    [kv_block[i][0][:, :, is_bi_sorted],
+     kv_block[i][1][:, :, is_bi_sorted]]
+    for i in range(len(kv_block))
 ]
 ```
 
@@ -216,16 +238,43 @@ This eliminates all `Counter` objects and `.tolist()` calls. The only remaining 
 
 ## 8. Overhead Analysis
 
-With default parameters (`block_size=4096`, `num_chunks=4`, `chunk_size=32`, `sink_size=64`):
+### Experimental Configuration
 
-- **Summary tokens per block**: $4 \times 32 = 128$ tokens
-- **Worst-case block input** (last block in a 16-block sequence): $64_{\text{sink}} + 15 \times 128_{\text{summaries}} + 4096_{\text{block}} = 6080$ tokens
+Our experiments use a **fixed-4-block design**: the number of blocks is held constant at 4 across all sequence lengths, with `block_size = seqlen / 4`. The summary budget is fixed at **12.5% of each block**, implemented as `summary_chunks = block_size / (8 × chunk_size)`:
+
+| Seq length | block\_size | summary\_chunks | Tokens/block summary | Accumulated summary (3 blocks) |
+|---|---|---|---|---|
+| 16K | 4 096 | 16 | 512 | 1 536 |
+| 32K | 8 192 | 32 | 1 024 | 3 072 |
+| 64K | 16 384 | 64 | 2 048 | 6 144 |
+| 128K | 32 768 | 128 | 4 096 | 12 288 |
+
+Keeping num\_blocks fixed means the accumulated summary grows **linearly** with sequence length (not quadratically), because the per-block budget and the number of contributing blocks both scale proportionally.
+
+### Memory and Compute
+
+- **Worst-case block input** (last block at 128K): $64_{\text{sink}} + 12\,288_{\text{summaries}} + 32\,768_{\text{block}} = 45\,120$ tokens
+- **KV cache at query phase**: Full context KV equals the original sequence length (summary KV is discarded). At 128K with Llama-3.1-8B (8 KV heads, head\_dim 128, 32 layers, bf16): $128\text{K} \times 128\text{ KB/token} = 16\text{ GB}$.
 - **Summary computation**: $O(\text{block\_size})$ per block — dominated by `torch.bincount` and `idf_table` lookup. Negligible relative to transformer forward pass.
-- **Memory**: Summary KV states are discarded, so the final KV cache size equals the original context length.
+- **Memory vs Star Attention**: At the query phase, Star Attention attends to `block_size + anchor_size = 2 × block_size` KV tokens per query step. Our method attends to `block_size + accumulated_summary` tokens. For sequences up to 64K this is strictly less than Star Attention's anchor; at 128K (45K vs 65K) it remains less.
 
 ---
 
-## 9. Design Decisions Summary
+## 9. Fixed-Block-Count Scaling Strategy
+
+A key experimental design choice is to keep the **number of blocks fixed at 4** across all sequence lengths rather than fixing the block size. This has several consequences:
+
+**Block size scales with context**: `block_size = seqlen / num_blocks`. Each block always represents the same *fraction* of the total context (25%), ensuring that the computational and informational structure of each block remains consistent across sequence lengths.
+
+**Summary budget scales proportionally**: Holding the summary fraction fixed at 12.5% of each block means `summary_chunks × chunk_size = 0.125 × block_size`. The absolute token count per block summary doubles with each doubling of sequence length, but the *relative* coverage is constant.
+
+**Comparison fairness**: Anchor (Star Attention baseline) also uses 4 blocks with `anchor_size = block_size`. Both methods therefore operate over the same block granularity, making accuracy comparisons directly attributable to the selection mechanism rather than block-count differences.
+
+**Limitation at very long contexts**: With 4 blocks at 128K, each block is 32K tokens, which places high demands on single-GPU memory during the forward pass. At 128K we process blocks of 32K + 12K accumulated summary = 44K tokens per forward call. This is tractable on 80 GB GPUs but leaves limited headroom.
+
+---
+
+## 10. Design Decisions Summary
 
 | Decision | Rationale |
 |---|---|
@@ -234,5 +283,8 @@ With default parameters (`block_size=4096`, `num_chunks=4`, `chunk_size=32`, `si
 | Causal summaries only ($j < i$) | Matches causal mask; avoids dead computation |
 | Attention sinks (64 tokens) | Stabilises softmax without anchor overhead |
 | KV discard by default | Prevents duplicate tokens in Phase 2 global attention |
-| 4 heuristics | Covers different retrieval profiles (general, length-normalised, diversity, needle) |
+| 6 heuristics | Covers general (TF-IDF, BM25), diversity (entropy), needle (max\_idf), positional (evenly\_spaced), soft (mean\_pool) |
 | Contiguous chunk selection | Each chunk is a self-contained text region the Transformer can meaningfully attend to |
+| Fixed 4 blocks, scaling block\_size | Consistent block granularity across seq lengths; fair comparison with Star Attention anchor |
+| 12.5% summary budget | Constant fraction of context preserved regardless of sequence length |
+| Anchor kept as `summary_method="anchor"` | Direct apples-to-apples baseline without changing block structure |
