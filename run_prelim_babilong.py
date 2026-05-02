@@ -309,7 +309,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--summary_chunks",
-        default="4,16,32",
+        default="8,32",
         help=(
             "CSV list of summary_chunks budgets to sweep. "
             "With block_size=4096 and chunk_size=32 over a 16K context "
@@ -353,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--stop_words", default="")
 
     # Dataset
-    parser.add_argument("--dataset_config", default="16k")
+    parser.add_argument("--dataset_config", default="32k")
     parser.add_argument("--start_sample_index", type=int, default=0)
     parser.add_argument("--num_samples", type=int, default=100)
 
