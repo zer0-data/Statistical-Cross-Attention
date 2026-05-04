@@ -4,6 +4,7 @@ __pycache__/
 .vscode/
 *.out
 archive/
+.claude/
 hotpotqa.json
 squad.json
 PaulGrahamEssays.json

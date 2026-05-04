@@ -155,12 +155,14 @@ Statistical Cross-Attention replaces the fixed anchor block with lightweight, no
 
 ### How It Works
 
-Each block is divided into non-overlapping **fixed-size chunks** (default: 32 tokens each). Every chunk is scored as a unit using one of four heuristics:
+Each block is divided into non-overlapping **fixed-size chunks** (default: 32 tokens each). Every chunk is scored as a unit using one of six heuristics:
 
-- **TF-IDF** (default): Computes mean per-token TF-IDF across the chunk, using corpus-level document frequencies computed over all blocks.
-- **BM25**: Scores each chunk using BM25 with `k1=1.2`, `b=0.75`, and average chunk length normalisation.
-- **Entropy**: Scores each chunk by `unique_token_count / chunk_len` — a vectorized proxy for lexical diversity. Chunks full of padding or repeated stop-words score near 0; entity-rich, information-dense chunks score near 1.
-- **Max-IDF**: Scores each chunk by the maximum IDF value of any token it contains. A single hyper-rare token (UUID, unusual name, NIAH needle) is sufficient to push the chunk to the top, even if the surrounding tokens are generic filler.
+- **TF-IDF** (default): Mean per-token TF-IDF across the chunk using corpus-level document frequencies over all blocks.
+- **BM25**: BM25 with `k1=1.2`, `b=0.75`, and average chunk length normalisation. Adds TF saturation and length penalties.
+- **Entropy**: `unique_token_count / chunk_len` — corpus-independent proxy for lexical diversity. Penalises padding and repeated filler.
+- **Max-IDF**: Maximum IDF value of any single token in the chunk. A single rare token (UUID, name, NIAH needle) pushes the chunk to the top regardless of surrounding filler. Best for retrieval tasks.
+- **Evenly Spaced**: Selects tokens at uniform intervals — a position-only, non-semantic baseline with the same token budget as the scoring methods.
+- **Anchor** (`summary_method=anchor`): Replicates NVIDIA's original Star Attention behaviour — block 0 contributes its entire post-sink content as a fixed prefix visible to every later block. Used as the primary baseline.
 
 The top `num_chunks` highest-scoring chunks per block are selected and returned **in positional order**, preserving natural language structure so the Transformer produces healthy K/V states. Each summary token retains its **original position ID** for RoPE compatibility.
 
@@ -181,15 +183,22 @@ After the forward pass, only `B_i`'s KV states are retained — all summary KV s
 |------|---------|-------------|
 | `--summary_chunks` | `4` | Number of contiguous chunks to select per block |
 | `--chunk_size` | `32` | Number of tokens per summary chunk |
-| `--summary_method` | `tfidf` | Chunk scoring heuristic (`tfidf`, `bm25`, `entropy`, or `max_idf`) |
-| `--sink_size` | `64` | Number of leading tokens always injected as attention sinks into every block's context (set to `0` to disable) |
+| `--summary_method` | `tfidf` | Chunk scoring heuristic: `tfidf`, `bm25`, `entropy`, `max_idf`, `evenly_spaced`, `anchor` |
+| `--sink_size` | `64` | Number of leading tokens always injected as attention sinks (set `0` to disable) |
 | `--no_discard_summary_kv` | off | If set, keeps summary KV states in the final cache |
 
-The total number of summary tokens per block is `summary_chunks × chunk_size` (default: `4 × 32 = 128`).
+The total summary tokens per block is `summary_chunks × chunk_size`. In our experiments we fix **4 blocks** and scale `block_size = seq_len / 4`, holding the summary budget at **12.5% of each block**:
+
+| Seq length | block\_size | summary\_chunks | Tokens/block |
+|---|---|---|---|
+| 16K | 4 096 | 16 | 512 |
+| 32K | 8 192 | 32 | 1 024 |
+| 64K | 16 384 | 64 | 2 048 |
+| 128K | 32 768 | 128 | 4 096 |
 
 ### Overhead
 
-With `b=4096`, `num_chunks=4`, `chunk_size=32`, `m=16` blocks: each GPU processes at most `b + (m-1) × num_chunks × chunk_size = 4096 + 15 × 128 = 6016` tokens (for the last block). Summary computation is `O(block_size)` per block, negligible vs transformer compute.
+With 4 blocks at 128K (`block_size=32768`, `summary_chunks=128`, `chunk_size=32`): the last block processes at most `32768 + 64_sink + 3 × 128 × 32 = 45120` tokens. Summary computation is `O(block_size)` per block via vectorized PyTorch ops (`torch.bincount`, `idf_table` lookup) — negligible vs transformer compute. Since summary KV states are discarded after each block, the final KV cache size equals the original sequence length.
 
 ## Launching Inference with Star Attention
 
@@ -286,6 +295,14 @@ Given a system with $H$ hosts and an input sample with context $c$ followed by q
 
 ### Phase 1 - Context Encoding (with Statistical Summaries)
 
+<div align="center">
+  <img
+    src="images/star_attn_phase1.png"
+    alt="star attention phase 1"
+  />
+</div>
+<br />
+
 - The context is segmented into contiguous blocks:
   <div align="center">
     $$c = [c_1, c_2, \ldots, c_n]$$
@@ -340,15 +357,26 @@ This method ensures that attention scores are correctly normalized across all ho
 ```
 Statistical-Cross-Attention/
 ├── model.py                        # Model classes and summary computation
-│   ├── compute_block_summaries()   # Chunk-based TF-IDF / BM25 scoring
+│   ├── compute_block_summaries()   # Chunk scoring: tfidf/bm25/entropy/max_idf/evenly_spaced/anchor
 │   ├── DistributedInferenceBaseModel
-│   ├── StarAttentionModel          # Phase 1 & 2 with summaries
-│   ├── DenseAttentionModel         # Standard dense attention
+│   ├── StarAttentionModel          # Phase 1 & 2 with statistical summaries
+│   ├── DenseAttentionModel         # Standard dense attention baseline
 │   └── RingAttentionModel          # Ring attention baseline
-├── run_star_attn_inference.py      # CLI entry point for custom data
+│
+├── theory.md                       # Full theoretical justification for all design decisions
+│
+│── Single-GPU preliminary sweeps (model loaded once, hyperparams mutate per cell)
+├── run_prelim_ruler.py             # RULER v1 single-GPU sweep script
+├── run_prelim_babilong.py          # BABILong single-GPU sweep script
+├── run_prelim_ruler.sh             # Shell wrapper: RULER sweep at 16K/32K/64K/128K
+├── run_prelim_babilong.sh          # Shell wrapper: BABILong sweep at 16K
+│
+│── Multi-GPU production runs (torchrun)
+├── run_star_attn_inference.py      # CLI entry point for custom JSONL data
 ├── run_ruler.py                    # RULER benchmark launcher
 ├── run_babilong.py                 # BABILong benchmark launcher
-├── launch.sh                       # Example launch configurations
+├── launch.sh                       # Example multi-GPU launch configurations
+│
 ├── star_attention/
 │   ├── modeling_llama.py           # Modified LlamaForCausalLM with Star/Ring attn
 │   ├── modeling_flash_attention_utils.py
@@ -356,6 +384,7 @@ Statistical-Cross-Attention/
 │   └── ring_flash_attn/            # Ring attention flash kernels
 ├── ruler/                          # RULER benchmark data & evaluation
 ├── babilong/                       # BABILong benchmark data & evaluation
+├── images/                         # Architecture diagrams
 ├── scripts/
 │   ├── download_hf_model.py        # Model download utility
 │   └── time_inference.py           # Inference timing script
