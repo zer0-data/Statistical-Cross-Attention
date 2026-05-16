@@ -14,3 +14,4 @@
 # limitations under the License.
 
 from .modeling_llama import LlamaForCausalLM
+from .modeling_qwen3 import Qwen3ForCausalLM
