@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 
@@ -293,15 +293,22 @@ class DistributedInferenceBaseModel:
         block_size: int = -1,
         anchor_block_size: int = -1,
     ):
-        from star_attention import LlamaForCausalLM
-
         self._init_distributed()
 
         # Setup the tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(path)
 
+        # Select the star-attention model class based on architecture
+        model_type = getattr(AutoConfig.from_pretrained(path), 'model_type', 'llama')
+        if model_type == 'qwen3':
+            from star_attention import Qwen3ForCausalLM
+            ModelClass = Qwen3ForCausalLM
+        else:
+            from star_attention import LlamaForCausalLM
+            ModelClass = LlamaForCausalLM
+
         # Define the model
-        self.model = LlamaForCausalLM.from_pretrained(
+        self.model = ModelClass.from_pretrained(
             path,
             device_map='auto',
             torch_dtype=torch.bfloat16,
